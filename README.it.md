@@ -132,102 +132,40 @@ Imposta `server` con l'IP reale del tuo FortiGate e genera un `secret` reale
 (`openssl rand -base64 24`). Vedi
 [Riferimento configurazione](#riferimento-configurazione) per tutte le chiavi.
 
-### 2. Abilitare la ricezione RADIUS Accounting su FortiGate
+### 2. Configurare FortiGate per usare i dati di accounting
 
-FortiGate non accetta pacchetti RADIUS Accounting su nessuna interfaccia di
-default — va abilitato sull'interfaccia che riceve il traffico dal tuo
-gateway eduVPN.
+Il compito di questo daemon è unicamente parlare RADIUS Accounting standard
+(RFC 2866) con FortiGate; il modo in cui FortiGate trasforma questo in
+firewall policy identity-aware si configura interamente lato FortiGate,
+tramite la sua funzione RADIUS Single Sign-On (RSSO), ed è indipendente da
+questa repository.
 
-Trova l'interfaccia corretta (quella la cui subnet include l'IP del tuo
-gateway):
-```
-get system interface physical
-```
+A livello concettuale, quattro cose devono esistere su FortiGate —
+indipendentemente dalla versione FortiOS o dal layout della GUI:
 
-Via CLI:
-```
-config system interface
-    edit "<nome-interfaccia>"
-        append allowaccess radius-acct
-    next
-end
-```
-Verifica: `show system interface <nome-interfaccia> | grep allowaccess` deve
-elencare `radius-acct`.
+1. **Ricezione accounting** sull'interfaccia rivolta verso questo daemon, per
+   la porta configurata in `eduvpn-radius.conf` (default UDP 1813).
+2. **Un agente RSSO** (un "RADIUS Single Sign-On agent" / External Connector
+   in FortiOS), configurato con lo stesso `secret` condiviso di questo
+   daemon, e a cui viene detto quale attributo RADIUS porta l'IP del client
+   e quale il suo gruppo/contesto — vedi
+   [Dati inviati a FortiGate](#dati-inviati-a-fortigate) qui sotto per gli
+   attributi esatti che questo daemon popola.
+3. **Un gruppo utenti** di tipo RSSO che referenzia quell'agente, così le
+   firewall policy possono selezionare "tutti gli utenti riportati da
+   questo daemon".
+4. **Una firewall policy** la cui sorgente copre i tuoi pool di indirizzi
+   VPN e che referenzia quel gruppo RSSO, rendendo identity-aware i suoi log
+   e il controllo degli accessi.
 
-Via GUI: **Network → Interfaces** → seleziona l'interfaccia → **Edit** →
-**Administrative Access** → spunta **RADIUS Accounting** → **OK**.
+I comandi CLI esatti e le schermate GUI per questi passaggi cambiano tra le
+varie release di FortiOS, quindi questo README non ne mantiene
+deliberatamente una copia — segui invece la documentazione ufficiale di
+Fortinet, allineata alla tua versione:
 
-### 3. Creare l'RSSO Agent (External Connector)
-
-In FortiOS 7.4, l'agente RSSO si trova sotto **Security Fabric → External
-Connectors**, non sotto User & Authentication → RADIUS Servers. `set server`
-non è un parametro valido qui — l'agente è un listener locale sulla porta
-1813, che accetta pacchetti da qualsiasi sorgente con il secret corretto.
-
-| Parametro CLI | Ruolo |
-|---|---|
-| `rsso-endpoint-attribute` | Attributo RADIUS che porta l'**IP** del client |
-| `sso-attribute` | Attributo RADIUS che porta il **gruppo/contesto** dell'utente — necessario perché il gruppo compaia nella dashboard |
-
-Via CLI:
-```
-config user radius
-    edit "eduvpn-rsso"
-        set rsso enable
-        set rsso-secret "CHANGE_ME_use_a_long_random_secret"
-        set rsso-radius-response enable
-        set rsso-endpoint-attribute Framed-IP-Address
-        set sso-attribute Called-Station-Id
-        set rsso-flush-ip-session enable
-        set rsso-log-flags all
-    next
-end
-```
-Verifica: `show user radius eduvpn-rsso` (il secret compare cifrato).
-
-Via GUI: **Security Fabric → External Connectors → Create New →
-RADIUS Single Sign-On Agent**, compila Name (`eduvpn-rsso`), il secret
-condiviso, abilita **Send RADIUS Responses**, imposta Endpoint Attribute su
-`Framed-IP-Address` e SSO Attribute su `Called-Station-Id`, abilita
-**Flush Endpoint IP Sessions**.
-
-Una versione pronta da incollare di tutti i blocchi CLI di questa sezione è
-in [`examples/fortigate-rsso-cli.conf`](examples/fortigate-rsso-cli.conf).
-
-### 4. Creare il gruppo utenti RSSO
-
-```
-config user group
-    edit "eduvpn-vpn-users"
-        set group-type rsso
-        set member "eduvpn-rsso"
-    next
-end
-```
-
-### 5. Referenziare il gruppo in una firewall policy
-
-```
-config firewall policy
-    edit 0
-        set name "eduvpn-users-internet"
-        set srcintf "<interfaccia-interna>"
-        set dstintf "<interfaccia-wan>"
-        set srcaddr "10.20.0.0/22"
-        set dstaddr "all"
-        set groups "eduvpn-vpn-users"
-        set action accept
-        set schedule "always"
-        set service "ALL"
-        set logtraffic all
-        set logtraffic-start enable
-    next
-end
-```
-
-> Sostituisci `10.20.0.0/22` con l'aggregato che copre tutti i pool di
-> indirizzi VPN che assegni ai profili eduVPN.
+- [Fortinet Document Library](https://docs.fortinet.com/) — cerca "RADIUS
+  Single Sign-On" o "RSSO agent" per la tua versione FortiOS
+- ad es. [Configuring RADIUS SSO authentication (FortiOS 7.6)](https://docs.fortinet.com/document/fortigate/7.6.2/administration-guide/513092/configuring-radius-sso-authentication)
 
 ## Riferimento configurazione
 
@@ -244,13 +182,17 @@ fornito):
 | `[eduvpn]` | `log_path` | `/var/log/eduvpn/eduvpn.log` | Log del correlatore da seguire |
 | `[eduvpn]` | `state_path` | `/var/lib/eduvpn-radius/state.json` | File di persistenza sessioni |
 
-## Mapping attributi RSSO
+## Dati inviati a FortiGate
+
+Questo è il contratto dati RADIUS Accounting implementato da questo daemon —
+mappa questi attributi sull'agente RSSO di FortiGate per utilizzarli:
 
 | Parametro | Valore |
 |---|---|
-| Porta RADIUS Accounting | UDP `1813` |
+| Porta RADIUS Accounting | UDP `1813` (o la porta configurata) |
 | Attributo endpoint (IP) | `Framed-IP-Address` (+ `Framed-IPv6-Address` per IPv6) |
 | Attributo gruppo/contesto | `Called-Station-Id` (il nome del profilo VPN) |
+| Attributo di abbinamento sessione | `Acct-Session-Id` (abbina ogni Stop al proprio Start) |
 
 ## Test di connettività
 
@@ -295,7 +237,7 @@ try:
     print("      OK — Start accepted")
 except Timeout:
     print("      ERROR Timeout — FortiGate not responding on UDP/1813")
-    print("      Check allowaccess radius-acct on the interface")
+    print("      Check that the receiving interface accepts RADIUS Accounting")
     print(f"      Check routing: ip route get {FORTIGATE}")
     sys.exit(1)
 except Exception as e:
@@ -303,9 +245,9 @@ except Exception as e:
     sys.exit(1)
 
 print()
-print("Now verify on FortiGate:")
-print("  diagnose test application radiusd 6")
-print("  diagnose firewall auth list")
+print("Now check FortiGate's RSSO / authenticated-users status (GUI or")
+print("diagnostic CLI, per Fortinet's documentation) for a 'connectivity_test'")
+print("entry mapped to the IPs above.")
 print()
 input("Press ENTER to send Accounting-Stop and clean up...")
 print()
@@ -326,109 +268,51 @@ except Exception as e:
     print(f"      ERROR on Stop: {e}")
 
 print()
-print("Final check on FortiGate:")
-print("  diagnose test application radiusd 6")
-print("  (should be empty or not contain connectivity_test)")
+print("Final check: confirm on FortiGate that the 'connectivity_test' entry")
+print("is now gone from its RSSO / authenticated-users status.")
 PYEOF
 
 python3 /tmp/radius-test.py
 ```
 
-### Procedura di test sincronizzata
+Mentre lo script è in pausa tra Start e Stop, gli strumenti di packet
+capture e di diagnostica RSSO/utenti-autenticati di FortiGate (GUI o CLI,
+documentati da Fortinet per la tua versione FortiOS — vedi i link sopra) ti
+permettono di confermare che i pacchetti sono arrivati e che il mapping è
+stato creato, prima che lo Stop lo rimuova di nuovo.
 
-Sul **FortiGate**, apri uno sniffer in una sessione SSH separata prima di
-lanciare lo script:
-```
-diagnose sniffer packet any "host <IP-NAS> and udp port 1813" 6 0 l
-```
+## Risoluzione problemi
 
-Sul **gateway eduVPN**, lancia lo script: `python3 /tmp/radius-test.py`. Lo
-sniffer dovrebbe mostrare 2 pacchetti (Start + risposta). Mentre lo script è
-in pausa, controlla `diagnose test application radiusd 6` — dovresti vedere
-`connectivity_test` con `10.20.0.99` e `2001:db8:1234:5678::99` — e
-`diagnose firewall auth list`, che dovrebbe mostrare `type: rsso` e
-`group_name: eduvpn-vpn-users`. Premi INVIO; lo sniffer mostra altri 2
-pacchetti (Stop + risposta), ed entrambe le entry dovrebbero sparire da
-`diagnose test application radiusd 6`.
+La maggior parte dei problemi ricade su uno di due lati:
 
-## Debug su FortiGate
+- **Questo daemon non invia, o invia dati sbagliati** — controlla
+  `sudo journalctl -u eduvpn-radius -f`: eventi connect/disconnect, timeout
+  RADIUS ed errori di configurazione sono tutti loggati lì in linguaggio
+  chiaro (vedi
+  [Riferimento configurazione](#riferimento-configurazione)).
+- **FortiGate non li riceve, o non li usa** — usando gli strumenti
+  diagnostici ufficiali di Fortinet per la tua versione FortiOS, verifica
+  che: l'interfaccia di ricezione accetti RADIUS Accounting sulla porta
+  configurata; il secret condiviso dell'agente RSSO corrisponda al `secret`
+  di questo daemon; il mapping degli attributi endpoint/gruppo dell'agente
+  RSSO corrisponda a [Dati inviati a FortiGate](#dati-inviati-a-fortigate);
+  e che la firewall policy referenzi effettivamente il gruppo RSSO.
 
-> FortiGate potrebbe gestire RADIUS anche per altri scopi. Tutti i comandi
-> qui sotto filtrano esplicitamente per l'IP del gateway eduVPN per non
-> interferire con altri agenti RADIUS già configurati.
+I comandi esatti di packet-capture, debug RADIUS e stato utenti autenticati
+sono coperti dalla documentazione Fortinet (vedi i link in
+[Passaggi post-installazione](#passaggi-post-installazione)) invece che
+duplicati qui, perché è più probabile che restino accurati tra le release
+FortiOS rispetto a una copia mantenuta in questo README.
 
-Controlli preliminari (nessun traffico generato):
-```
-show system interface <nome-interfaccia> | grep allowaccess
-show user radius eduvpn-rsso
-show user group eduvpn-vpn-users
-```
+### Sintomi comuni
 
-Sniffer (non invasivo, conferma la ricezione dei pacchetti):
-```
-diagnose sniffer packet any "host <IP-NAS> and udp port 1813" 6 0 l
-```
-Output atteso:
-```
-interfaces=[any]
-filters=[host <IP-NAS> and udp port 1813]
-2.634108 <IP-NAS>.XXXXX -> <IP-FortiGate>.1813: udp 92
-2.634891 <IP-FortiGate>.1813 -> <IP-NAS>.XXXXX: udp 20
-```
-La seconda riga (risposta del FortiGate) conferma che
-`rsso-radius-response enable` funziona e il secret è corretto. Se compare
-solo la prima riga, il secret è sbagliato o all'interfaccia manca
-`radius-acct`.
-
-Debug live di radiusd (filtra visivamente per l'IP del tuo NAS):
-```
-diagnose debug reset
-diagnose debug application radiusd -1
-diagnose debug enable
-```
-Output atteso per uno Start corretto:
-```
-radiusd: recv Accounting-Request from <IP-NAS>:XXXXX
-radiusd:   User-Name = alice
-radiusd:   Framed-IP-Address = 10.20.0.5
-radiusd:   Framed-IPv6-Address = 2001:db8:1234:5678::5
-radiusd:   Called-Station-Id = staff
-radiusd:   Acct-Status-Type = Start
-radiusd: add rsso user alice ip 10.20.0.5 group eduvpn-rsso
-```
-Disabilita subito dopo il test: `diagnose debug disable && diagnose debug reset`.
-
-Stato del database RSSO:
-```
-diagnose test application radiusd 6    # riepilogo, una riga per entry
-diagnose test application radiusd 66   # dettaglio completo, tutti gli attributi
-```
-
-Utenti autenticati, filtrati per la tua subnet VPN:
-```
-diagnose firewall auth filter src 10.20.0.0/22
-diagnose firewall auth list
-diagnose firewall auth filter clear
-```
-
-Pulizia:
-```
-diagnose firewall auth delete <username>   # singolo utente, altri agenti non toccati
-diagnose firewall auth clear               # TUTTE le entry RSSO sul FortiGate — usare con cautela
-```
-
-### Errori comuni
-
-| Messaggio | Causa | Soluzione |
+| Sintomo | Lato probabile | Cosa verificare |
 |---|---|---|
-| `bad authenticator` | Secret non corrispondente | Verifica che `rsso-secret` corrisponda a `secret` in `eduvpn-radius.conf` |
-| Nessun output di debug | Pacchetti non in arrivo | Usa lo sniffer per confermare la ricezione |
-| `no rsso agent configured` | Agente non creato | Esegui il passaggio 3 di Post-installazione |
-| Solo IPv4 aggiunto, non IPv6 | `Framed-IPv6-Address` assente dal pacchetto | Il daemon lo include già; verifica che lo script di test includa entrambi |
-| Gruppo vuoto nella dashboard | `sso-attribute` non impostato | `set sso-attribute Called-Station-Id` |
-| Le entry non spariscono alla disconnessione | `rsso-flush-ip-session` disabilitato | `set rsso-flush-ip-session enable` |
-| `RADIUS timeout` nel log del daemon | FortiGate non raggiungibile su UDP/1813 | Verifica `allowaccess radius-acct` sull'interfaccia |
-| File di log non trovato all'avvio | Correlatore non in esecuzione | Avvia prima il correlatore; il daemon riprova ogni 10s |
+| `RADIUS timeout` nel log del daemon | FortiGate / rete | Ricezione accounting abilitata sull'interfaccia e porta corrette; routing/firewalling tra i due host |
+| Il daemon logga `ok=True` ma su FortiGate non compare nulla | FortiGate | Secret condiviso e mapping attributi dell'agente RSSO |
+| FortiGate mostra l'IP ma nessuna etichetta gruppo/utente | FortiGate | Mapping dell'attributo gruppo/contesto dell'agente RSSO |
+| Le entry non spariscono mai dopo la disconnessione | FortiGate | Comportamento di flush sessione dell'agente RSSO |
+| File di log non trovato all'avvio | Questo daemon / correlatore | Il correlatore (es. eduvpn-logger) non è ancora in esecuzione — il daemon riprova ogni 10s |
 
 ## Installazione manuale
 
@@ -477,12 +361,9 @@ sudo systemctl restart eduvpn-radius
 openssl rand -base64 24
 sudo nano /etc/eduvpn-radius/eduvpn-radius.conf   # aggiorna il secret
 sudo systemctl restart eduvpn-radius
-# poi sul FortiGate:
-#   config user radius
-#       edit "eduvpn-rsso"
-#           set rsso-secret "<nuovo-secret>"
-#       next
-#   end
+# poi aggiorna lo stesso secret sull'agente RSSO di FortiGate — vedi la
+# documentazione Fortinet (link in "Passaggi post-installazione") per la
+# tua versione FortiOS
 ```
 
 ## Test

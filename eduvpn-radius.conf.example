@@ -1,0 +1,24 @@
+[radius]
+# FortiGate IP address that will receive RADIUS Accounting packets (UDP port 1813).
+# Example value only (RFC 5737 TEST-NET-3) — replace with your FortiGate's real address.
+server = 203.0.113.1
+
+# RADIUS Accounting port — default 1813, rarely needs changing.
+port = 1813
+
+# Shared secret configured on the FortiGate RSSO agent (External Connector).
+# CHANGE THIS before starting the service. Generate one with:
+#   openssl rand -base64 24
+secret = CHANGE_ME_use_a_long_random_secret
+
+# NAS-Identifier sent in RADIUS packets. Optional: if omitted, the daemon
+# uses the local hostname (socket.gethostname()) as the default.
+#nas_identifier = vpn.example.org
+
+[eduvpn]
+# Path to the eduVPN correlator log (produced by eduvpn-logger or a
+# compatible tool). Default matches a stock eduvpn-logger install.
+log_path = /var/log/eduvpn/eduvpn.log
+
+# State file used to persist active sessions across daemon restarts.
+state_path = /var/lib/eduvpn-radius/state.json

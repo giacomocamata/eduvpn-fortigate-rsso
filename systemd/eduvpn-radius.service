@@ -1,0 +1,24 @@
+[Unit]
+Description=eduVPN RADIUS Accounting daemon (FortiGate RSSO)
+Documentation=file:///usr/local/lib/eduvpn-radius/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/lib/eduvpn-radius/eduvpn-radius.py /etc/eduvpn-radius/eduvpn-radius.conf
+Restart=on-failure
+RestartSec=10
+
+# Logging to the systemd journal
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=eduvpn-radius
+
+# The daemon sends Accounting-Stop for all sessions on SIGTERM.
+# Default KillSignal (SIGTERM) is fine.
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

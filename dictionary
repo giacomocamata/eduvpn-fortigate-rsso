@@ -1,0 +1,22 @@
+# Minimal RADIUS dictionary for eduvpn-radius
+# RFC 2865 (base), RFC 2866 (accounting), RFC 3162 (IPv6)
+
+ATTRIBUTE   User-Name               1   string
+ATTRIBUTE   Framed-IP-Address       8   ipaddr
+ATTRIBUTE   Called-Station-Id       30  string
+ATTRIBUTE   NAS-Identifier          32  string
+ATTRIBUTE   Acct-Status-Type        40  integer
+ATTRIBUTE   Acct-Delay-Time         41  integer
+ATTRIBUTE   Acct-Input-Octets       42  integer
+ATTRIBUTE   Acct-Output-Octets      43  integer
+ATTRIBUTE   Acct-Session-Id         44  string
+ATTRIBUTE   Acct-Authentic          45  integer
+ATTRIBUTE   Acct-Session-Time       46  integer
+ATTRIBUTE   Acct-Input-Packets      47  integer
+ATTRIBUTE   Acct-Output-Packets     48  integer
+ATTRIBUTE   Acct-Terminate-Cause    49  integer
+ATTRIBUTE   Framed-IPv6-Address     168 ipv6addr
+
+VALUE       Acct-Status-Type    Start           1
+VALUE       Acct-Status-Type    Stop            2
+VALUE       Acct-Status-Type    Interim-Update  3

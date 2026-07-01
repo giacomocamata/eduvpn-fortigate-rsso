@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+
+# Never publish a real, secret-bearing configuration from this working folder
+eduvpn-radius.conf
+
+# Local-only context for Claude Code — not for publication
+CLAUDE.md

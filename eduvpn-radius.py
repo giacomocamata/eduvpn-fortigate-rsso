@@ -181,6 +181,21 @@ def handle_connect(kv: Dict[str, str]) -> None:
         logger.info("stop(replaced) user=%s ip4=%s conn=%.12s",
                     old.get("user", "-"), old.get("ip4", "-"), conn)
 
+    # The VPN pool reassigns freed IPs: if a *different* tracked session still
+    # holds this ip4/ip6, its disconnect was missed (e.g. daemon downtime) and
+    # the session is provably dead. Close it now, or its stale user→IP mapping
+    # would be replayed over the new user's on the next recover_sessions().
+    for other_conn, other in list(sessions.items()):
+        if other_conn == conn:
+            continue
+        same4 = ip4 not in ("-", "") and other.get("ip4") == ip4
+        same6 = ip6 not in ("-", "") and other.get("ip6") == ip6
+        if same4 or same6:
+            sessions.pop(other_conn, None)
+            _send(2, other)
+            logger.info("stop(ip-reassigned) user=%s ip4=%s conn=%.12s",
+                        other.get("user", "-"), other.get("ip4", "-"), other_conn)
+
     sess = {
         "user":            user,
         "ip4":             ip4,
@@ -294,10 +309,16 @@ def follow_log(log_path: str) -> None:
                     line = f.readline()
                     if not line:
                         time.sleep(0.3)
-                        # Check whether the file was rotated (inode changed)
+                        # Check whether the file was rotated (inode changed) or
+                        # truncated in place (logrotate copytruncate: same inode,
+                        # size below our offset — readline() would block forever).
                         try:
-                            if os.stat(log_path).st_ino != current_ino:
+                            st = os.stat(log_path)
+                            if st.st_ino != current_ino:
                                 logger.info("Log rotated, reopening file")
+                                break
+                            if st.st_size < f.tell():
+                                logger.info("Log truncated, reopening file")
                                 break
                         except FileNotFoundError:
                             break

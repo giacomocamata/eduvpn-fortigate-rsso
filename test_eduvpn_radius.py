@@ -118,6 +118,34 @@ def test_handle_connect_rapid_reconnect():
     assert len(mod.sessions) == 1
 
 
+def test_handle_connect_evicts_reassigned_pool_ip():
+    # The pool reassigns freed IPs. If a tracked session (whose disconnect the
+    # daemon missed while it was down) still holds the IP now given to a new
+    # peer, it is provably dead and must be evicted — otherwise recovery would
+    # replay the stale user→IP mapping over the new user's.
+    mod.radius_client = None
+    mod.state_path = os.path.join(tempfile.mkdtemp(), "state.json")
+    mod.sessions = {
+        "stale-peer": {"user": "bob", "ip4": "10.20.0.5", "ip6": "-",
+                       "profile": "staff", "acct_session_id": "deadbeef00000001"}
+    }
+
+    mod.handle_connect({"conn": "peerB", "user": "alice", "tunnel_ip4": "10.20.0.5",
+                         "tunnel_ip6": "-", "profile": "staff"})
+    assert "stale-peer" not in mod.sessions
+    assert mod.sessions["peerB"]["user"] == "alice"
+    assert len(mod.sessions) == 1
+
+    # An unset ip4/ip6 ("-") must never match another session's "-"
+    mod.sessions = {
+        "peerC": {"user": "carol", "ip4": "-", "ip6": "-",
+                  "profile": "staff", "acct_session_id": "deadbeef00000002"}
+    }
+    mod.handle_connect({"conn": "peerD", "user": "dave", "tunnel_ip4": "-",
+                         "tunnel_ip6": "-", "profile": "staff"})
+    assert "peerC" in mod.sessions and "peerD" in mod.sessions
+
+
 def test_handle_disconnect():
     mod.radius_client = None
     mod.state_path = os.path.join(tempfile.mkdtemp(), "state.json")

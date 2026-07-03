@@ -1,5 +1,5 @@
 # Minimal RADIUS dictionary for eduvpn-radius
-# RFC 2865 (base), RFC 2866 (accounting), RFC 3162 (IPv6)
+# RFC 2865 (base), RFC 2866 (accounting), RFC 6911 (Framed-IPv6-Address)
 
 ATTRIBUTE   User-Name               1   string
 ATTRIBUTE   Framed-IP-Address       8   ipaddr

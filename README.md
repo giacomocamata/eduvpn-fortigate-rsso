@@ -57,6 +57,12 @@ decisions worth calling out:
   that already has an active session (same public key), the daemon closes the
   old session (Accounting-Stop) before opening the new one — no orphaned
   entries in FortiGate's table.
+- **Pool-IP reuse handling.** The VPN pool reassigns freed IPs. If a `connect`
+  assigns an IP that another tracked session still holds — meaning that
+  session's disconnect was missed, e.g. while the daemon was down — the stale
+  session is provably dead and gets closed (Accounting-Stop) on the spot, so
+  its old user→IP mapping can never be replayed over the new user's on
+  recovery.
 - **Graceful shutdown.** On SIGTERM/SIGINT the daemon sends Accounting-Stop for
   every active session before exiting, so a planned restart or stop never
   leaves stale RSSO entries behind (`TimeoutStopSec=30` in the systemd unit
@@ -363,8 +369,9 @@ python3 test_eduvpn_radius.py
 ```
 
 Covers the pure logic worth protecting: KV log-line parsing, atomic session
-state save/load, rapid-reconnect session replacement, and disconnect
-handling — with no `pyrad` install or network access required.
+state save/load, rapid-reconnect session replacement, stale-session eviction
+on pool-IP reuse, and disconnect handling — with no `pyrad` install or
+network access required.
 
 ## License
 

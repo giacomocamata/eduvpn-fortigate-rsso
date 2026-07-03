@@ -60,6 +60,12 @@ Alcune scelte degne di nota:
   WireGuard che ha già una sessione attiva (stessa public key), il daemon
   chiude prima la vecchia sessione (Accounting-Stop) e poi apre la nuova —
   nessuna entry orfana nella tabella del FortiGate.
+- **Gestione del riuso degli IP del pool.** Il pool VPN riassegna gli IP
+  liberati. Se un `connect` assegna un IP che un'altra sessione tracciata
+  detiene ancora — segno che il suo disconnect è andato perso, es. mentre il
+  daemon era fermo — quella sessione è provabilmente morta e viene chiusa
+  subito (Accounting-Stop), così il suo vecchio mapping user→IP non può mai
+  essere ripristinato al posto di quello del nuovo utente durante il recovery.
 - **Arresto graceful.** Su SIGTERM/SIGINT il daemon invia Accounting-Stop per
   tutte le sessioni attive prima di uscire, così un riavvio o arresto
   pianificato non lascia mai entry RSSO obsolete (`TimeoutStopSec=30` nella
@@ -374,8 +380,9 @@ python3 test_eduvpn_radius.py
 
 Copre la logica pura che vale la pena proteggere: parsing delle righe di log
 key=value, salvataggio/caricamento atomico dello stato sessioni, sostituzione
-sessione in caso di riconnessione rapida, e gestione della disconnessione —
-senza bisogno di installare `pyrad` o di accesso alla rete.
+sessione in caso di riconnessione rapida, eviction delle sessioni stantie al
+riuso di un IP del pool, e gestione della disconnessione — senza bisogno di
+installare `pyrad` o di accesso alla rete.
 
 ## Licenza
 

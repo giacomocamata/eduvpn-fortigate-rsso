@@ -2,28 +2,30 @@
 """
 eduvpn-radius — RADIUS Accounting daemon for FortiGate RSSO
 
-Reads /var/log/eduvpn/eduvpn.log (the output of the eduVPN correlator, e.g.
-eduvpn-logger) and sends RADIUS Accounting-Start/Stop packets to a FortiGate.
-
-FortiGate receives the packets and updates its user → IP mapping table,
-used by identity-based firewall policies (RSSO).
+Follows /var/log/eduvpn/eduvpn.log (written by eduvpn-logger or a compatible
+correlator) and sends RADIUS Accounting-Start/Stop packets to a FortiGate, whose
+RSSO agent turns them into a user → IP table for identity-based policies.
 
 Event handling:
-  connect    → Accounting-Start (with ip4, ip6, user, profile)
-  disconnect → Accounting-Stop  (with session-id for matching)
-  roam       → no RADIUS action: the assigned VPN IP does not change,
-               only the external source IP varies. The FortiGate
-               user→VPN_IP mapping remains valid.
+  connect    → Accounting-Start (user, profile, tunnel IPv4/IPv6)
+  disconnect → Accounting-Stop  (same Acct-Session-Id as the Start)
+  roam       → nothing: the tunnel IP does not change, only the public source IP
 
-Recovery on restart: the JSON state file keeps the active sessions;
-on restart the daemon re-sends Accounting-Start to restore them.
+Restarts: the state file keeps the active sessions AND the position reached in
+the log. On start the daemon first replays what was logged while it was down,
+then re-sends Accounting-Start for every session still open. On SIGTERM it sends
+Accounting-Stop for every session (no stale user → IP mapping while it is down)
+but keeps them in the state file for the next start.
 
 Usage:
-  eduvpn-radius.py [/path/to/config.conf]
+  eduvpn-radius.py [config]              run the daemon
+  eduvpn-radius.py --test IP [config]    send one test Start/Stop pair
   Default config: /etc/eduvpn-radius/eduvpn-radius.conf
 """
 
+import argparse
 import configparser
+import ipaddress
 import json
 import logging
 import os
@@ -33,36 +35,51 @@ import socket
 import sys
 import time
 import uuid
-from typing import Dict, Optional
+from typing import Dict, NoReturn, Optional
 
 try:
-    import pyrad.packet
     from pyrad.client import Client, Timeout
     from pyrad.dictionary import Dictionary
     HAS_PYRAD = True
 except ImportError:
     HAS_PYRAD = False
 
+    class Timeout(Exception):  # lets the module load (and be tested) without pyrad
+        pass
+
 # --------------------------------------------------------------------------
-# Default paths
+# Defaults
 # --------------------------------------------------------------------------
 DEFAULT_CONFIG = "/etc/eduvpn-radius/eduvpn-radius.conf"
 DEFAULT_STATE  = "/var/lib/eduvpn-radius/state.json"
 DEFAULT_LOG    = "/var/log/eduvpn/eduvpn.log"
 DICT_PATH      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dictionary")
+RETRY_SEC      = 30.0   # how often unconfirmed Accounting-Starts are re-sent
+POLL_SEC       = 0.3    # log polling interval at EOF
+SAVE_SEC       = 1.0    # min interval between state saves while reading a backlog
+EXIT_CONFIG    = 2      # bad configuration: systemd must not restart-loop on it
+
+START, STOP = 1, 2
 
 # --------------------------------------------------------------------------
 # Global state
 # --------------------------------------------------------------------------
 logger = logging.getLogger("eduvpn-radius")
 
-# Active sessions: conn (WireGuard pubkey) → session dict
+# Active sessions: conn (WireGuard public key) → {user, ip4, ip6, profile,
+# acct_session_id, ok}; ok = the last Accounting-Start was answered.
 sessions: Dict[str, dict] = {}
+# Position reached in the log: inode of the file being read and byte offset of
+# the first unprocessed line. Saved together with the sessions.
+log_pos: Dict[str, int] = {}
 
 cfg: Dict[str, str] = {}
 radius_client: Optional["Client"] = None
 state_path: str = DEFAULT_STATE
 _shutdown = False
+_next_retry = 0.0  # 0 = retry at the first EOF (sessions restored from state)
+_dirty = False     # sessions changed since the last save
+_last_save = 0.0
 
 # --------------------------------------------------------------------------
 # KV parser — handles both key=value and key="value with spaces"
@@ -79,34 +96,71 @@ def parse_kv(text: str) -> Dict[str, str]:
     return result
 
 
+def _ip(value: Optional[str]) -> str:
+    # "-" for missing or malformed addresses: pyrad would reject the whole packet.
+    try:
+        return str(ipaddress.ip_address(value or ""))
+    except ValueError:
+        return "-"
+
+
 # --------------------------------------------------------------------------
-# Session state persistence
+# State persistence
 # --------------------------------------------------------------------------
-def _load_state() -> Dict[str, dict]:
+def _load_state() -> None:
+    """Loads sessions and log position. Restored sessions are marked not
+    confirmed (ok=False): their Accounting-Start is re-sent once the backlog
+    has been read."""
+    global sessions, log_pos
+    sessions, log_pos = {}, {}
     try:
         with open(state_path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except FileNotFoundError:
-        return {}
+        return
     except Exception as e:
-        # Corrupted, unreadable, or otherwise unusable state file must never
-        # prevent the daemon from starting — start fresh instead.
+        # A corrupted or unreadable state file must never prevent the start.
         logger.warning("Could not load state file %s, starting empty: %s", state_path, e)
-        return {}
+        return
     if not isinstance(data, dict):
         logger.warning("State file %s has unexpected format, starting empty", state_path)
-        return {}
-    return data
+        return
+    if isinstance(data.get("sessions"), dict):
+        raw = data["sessions"]
+        pos = data.get("log")
+        if isinstance(pos, dict) and isinstance(pos.get("ino"), int) and isinstance(pos.get("pos"), int):
+            log_pos = {"ino": pos["ino"], "pos": pos["pos"]}
+    else:
+        raw = data  # format of the first release: {conn: session}, no position
+    for conn, sess in raw.items():
+        if isinstance(sess, dict) and sess.get("user") and sess.get("acct_session_id"):
+            sessions[conn] = dict(sess, ip4=_ip(sess.get("ip4")), ip6=_ip(sess.get("ip6")),
+                                  profile=sess.get("profile") or "-", ok=False)
+
+
+def _changed() -> None:
+    global _dirty
+    _dirty = True
+
+
+def _maybe_save(force: bool = False) -> None:
+    # Saving after every event made a backlog of thousands of events with
+    # thousands of open sessions crawl (one full JSON rewrite per line). Sessions
+    # and position are saved together, so a crash only replays the last second.
+    if _dirty and (force or time.monotonic() - _last_save >= SAVE_SEC):
+        _save_state()
 
 
 def _save_state() -> None:
+    global _dirty, _last_save
+    _dirty, _last_save = False, time.monotonic()
     tmp = state_path + ".tmp"
     try:
         state_dir = os.path.dirname(state_path)
         if state_dir:
             os.makedirs(state_dir, exist_ok=True)
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(sessions, f, indent=2)
+            json.dump({"log": log_pos, "sessions": sessions}, f, indent=1)
         os.replace(tmp, state_path)
     except Exception as e:
         logger.warning("Could not save state: %s", e)
@@ -120,44 +174,42 @@ def _make_session_id() -> str:
 
 
 def _send(status_type: int, sess: dict) -> bool:
-    """
-    Sends a RADIUS Accounting packet to FortiGate.
-    status_type: 1 = Start, 2 = Stop
-    Returns True if the packet was accepted (response received).
-    """
+    """Sends Accounting-Start (1) or -Stop (2). True if FortiGate answered."""
     if radius_client is None:
         return False
     try:
         pkt = radius_client.CreateAcctPacket()
         pkt["User-Name"]        = sess["user"]
-        pkt["Acct-Status-Type"] = "Start" if status_type == 1 else "Stop"
+        pkt["Acct-Status-Type"] = "Start" if status_type == START else "Stop"
         pkt["Acct-Session-Id"]  = sess["acct_session_id"]
-        pkt["NAS-Identifier"]   = cfg.get("nas_identifier", socket.gethostname())
-
-        if sess.get("profile") and sess["profile"] != "-":
+        pkt["NAS-Identifier"]   = cfg["nas_identifier"]
+        if sess.get("profile", "-") not in ("-", ""):
             pkt["Called-Station-Id"] = sess["profile"]
-
-        ip4 = sess.get("ip4", "-")
-        if ip4 and ip4 != "-":
-            pkt["Framed-IP-Address"] = ip4
-
-        ip6 = sess.get("ip6", "-")
-        if ip6 and ip6 not in ("-", ""):
-            try:
-                pkt["Framed-IPv6-Address"] = ip6
-            except Exception:
-                # Older pyrad versions may not support ipv6addr
-                pass
-
+        if sess.get("ip4", "-") != "-":
+            pkt["Framed-IP-Address"] = sess["ip4"]
+        if sess.get("ip6", "-") != "-":
+            pkt["Framed-IPv6-Address"] = sess["ip6"]
         radius_client.SendPacket(pkt)
         return True
-
     except Timeout:
-        logger.warning("RADIUS timeout towards %s", cfg.get("server", "?"))
+        logger.warning("RADIUS timeout towards %s:%s", cfg.get("server", "?"), cfg.get("port", "?"))
         return False
     except Exception as e:
         logger.warning("RADIUS error: %s", e)
         return False
+
+
+def _start(conn: str, sess: dict, why: str) -> None:
+    sess["ok"] = _send(START, sess)
+    logger.info("start(%s) user=%s ip4=%s ip6=%s profile=%s ok=%s conn=%.12s",
+                why, sess["user"], sess["ip4"], sess["ip6"], sess["profile"], sess["ok"], conn)
+
+
+def _stop(conn: str, sess: dict, why: str) -> bool:
+    ok = _send(STOP, sess)
+    logger.info("stop(%s) user=%s ip4=%s ip6=%s profile=%s ok=%s conn=%.12s",
+                why, sess["user"], sess["ip4"], sess["ip6"], sess["profile"], ok, conn)
+    return ok
 
 
 # --------------------------------------------------------------------------
@@ -166,255 +218,341 @@ def _send(status_type: int, sess: dict) -> bool:
 def handle_connect(kv: Dict[str, str]) -> None:
     conn    = kv.get("conn", "")
     user    = kv.get("user", "-")
-    ip4     = kv.get("tunnel_ip4", "-")
-    ip6     = kv.get("tunnel_ip6", "-")
+    ip4     = _ip(kv.get("tunnel_ip4"))
+    ip6     = _ip(kv.get("tunnel_ip6"))
     profile = kv.get("profile", "-")
 
     if not conn or user in ("-", ""):
+        return  # unattributed peer: nothing FortiGate could use
+    if ip4 == "-" and ip6 == "-":
+        logger.warning("connect without tunnel IP ignored user=%s conn=%.12s", user, conn)
         return
 
-    # If a session already exists for the same conn (rapid reconnect),
-    # close the old one first.
-    if conn in sessions:
-        old = sessions[conn]
-        _send(2, old)
-        logger.info("stop(replaced) user=%s ip4=%s conn=%.12s",
-                    old.get("user", "-"), old.get("ip4", "-"), conn)
+    old = sessions.get(conn)
+    if old is not None:
+        if (old["user"], old["ip4"], old["ip6"]) == (user, ip4, ip6):
+            # Same session announced again (eduvpn-logger re-announces active
+            # peers after its own restart): refresh, keep the session id.
+            _start(conn, old, "refresh")
+            _changed()
+            return
+        sessions.pop(conn)
+        _stop(conn, old, "replaced")
 
     # The VPN pool reassigns freed IPs: if a *different* tracked session still
-    # holds this ip4/ip6, its disconnect was missed (e.g. daemon downtime) and
-    # the session is provably dead. Close it now, or its stale user→IP mapping
-    # would be replayed over the new user's on the next recover_sessions().
+    # holds this ip4/ip6, its disconnect was missed and it is provably dead.
+    # Close it, or its user→IP mapping would be replayed over the new user's.
     for other_conn, other in list(sessions.items()):
-        if other_conn == conn:
-            continue
-        same4 = ip4 not in ("-", "") and other.get("ip4") == ip4
-        same6 = ip6 not in ("-", "") and other.get("ip6") == ip6
-        if same4 or same6:
-            sessions.pop(other_conn, None)
-            _send(2, other)
-            logger.info("stop(ip-reassigned) user=%s ip4=%s conn=%.12s",
-                        other.get("user", "-"), other.get("ip4", "-"), other_conn)
+        if (ip4 != "-" and other["ip4"] == ip4) or (ip6 != "-" and other["ip6"] == ip6):
+            sessions.pop(other_conn)
+            _stop(other_conn, other, "ip-reassigned")
 
-    sess = {
-        "user":            user,
-        "ip4":             ip4,
-        "ip6":             ip6,
-        "profile":         profile,
-        "acct_session_id": _make_session_id(),
-    }
+    sess = {"user": user, "ip4": ip4, "ip6": ip6, "profile": profile,
+            "acct_session_id": _make_session_id(), "ok": False}
     sessions[conn] = sess
-
-    ok = _send(1, sess)
-    logger.info("start user=%s ip4=%s ip6=%s profile=%s ok=%s conn=%.12s",
-                user, ip4, ip6, profile, ok, conn)
-    _save_state()
+    _start(conn, sess, "connect")
+    _changed()
 
 
 def handle_disconnect(kv: Dict[str, str]) -> None:
     conn = kv.get("conn", "")
-    user = kv.get("user", "-")
-
     if not conn:
         return
-
     sess = sessions.pop(conn, None)
     if sess is None:
-        # Untracked session (daemon was inactive during the connection)
-        logger.warning("disconnect for unknown session user=%s conn=%.12s", user, conn)
+        logger.info("disconnect for untracked session user=%s conn=%.12s", kv.get("user", "-"), conn)
         return
-
-    ok = _send(2, sess)
-    logger.info("stop user=%s ip4=%s ip6=%s profile=%s ok=%s conn=%.12s",
-                sess.get("user", "-"), sess.get("ip4", "-"), sess.get("ip6", "-"),
-                sess.get("profile", "-"), ok, conn)
-    _save_state()
-
-
-def handle_roam(kv: Dict[str, str]) -> None:
-    # The assigned VPN IP does NOT change during a WireGuard roam:
-    # only the client's external source IP changes (e.g. WiFi → LTE).
-    # The FortiGate user→VPN_IP mapping is still valid → no RADIUS action.
-    user    = kv.get("user", "-")
-    conn    = kv.get("conn", "")
-    src_old = kv.get("src_ip_old", "-")
-    src_new = kv.get("src_ip", "-")
-    logger.debug("roam user=%s conn=%.12s %s→%s (no RADIUS action)",
-                 user, conn, src_old, src_new)
+    _stop(conn, sess, "disconnect")
+    _changed()
 
 
 def process_line(line: str) -> None:
-    line = line.strip()
-    if not line or "event=" not in line:
+    # "<ISO-8601 timestamp> event=connect user=... conn=... tunnel_ip4="..." ..."
+    _ts, _sep, rest = line.strip().partition(" ")
+    if "event=" not in rest:
         return
-
-    # Format: "2025-01-15T10:30:00.000+00:00 event=connect user=..."
-    space = line.find(" ")
-    if space < 0:
-        return
-
-    kv = parse_kv(line[space + 1:])
+    kv = parse_kv(rest)
     event = kv.get("event")
-
     if event == "connect":
         handle_connect(kv)
     elif event == "disconnect":
         handle_disconnect(kv)
-    elif event == "roam":
-        handle_roam(kv)
+    # roam: the tunnel IP does not change, the FortiGate mapping stays valid.
 
 
 # --------------------------------------------------------------------------
-# Recovery on restart
+# Retry of unconfirmed Accounting-Starts (also the recovery after a restart)
 # --------------------------------------------------------------------------
-def recover_sessions() -> None:
-    if not sessions:
-        logger.info("No previous sessions to recover")
+def retry_starts() -> None:
+    global _next_retry
+    now = time.monotonic()
+    if now < _next_retry:
         return
-    logger.info("Recovery: re-sending Accounting-Start for %d active sessions", len(sessions))
-    for conn, sess in list(sessions.items()):
-        ok = _send(1, sess)
-        logger.info("recover start user=%s ip4=%s ok=%s conn=%.12s",
-                    sess.get("user", "-"), sess.get("ip4", "-"), ok, conn)
+    _next_retry = now + RETRY_SEC
+    pending = [(c, s) for c, s in sessions.items() if not s.get("ok")]
+    if not pending:
+        return
+    logger.info("Sending Accounting-Start for %d unconfirmed session(s)", len(pending))
+    for conn, sess in pending:
+        _start(conn, sess, "retry")
+        if not sess["ok"]:
+            break  # FortiGate unreachable: try the rest in RETRY_SEC, don't block
+    _changed()
 
 
 # --------------------------------------------------------------------------
-# Graceful shutdown
+# Log follower
 # --------------------------------------------------------------------------
-def _handle_shutdown(signum, frame) -> None:
-    global _shutdown
-    logger.info("Signal %d: sending Accounting-Stop for all sessions...", signum)
-    _shutdown = True
-    for conn, sess in list(sessions.items()):
-        _send(2, sess)
-        logger.info("stop(shutdown) user=%s ip4=%s conn=%.12s",
-                    sess.get("user", "-"), sess.get("ip4", "-"), conn)
-    sessions.clear()
-    _save_state()
-    sys.exit(0)
+def _process_bytes(raw: bytes) -> None:
+    try:
+        process_line(raw.decode("utf-8", errors="replace"))
+    except Exception as e:  # one bad line must never stop the follower
+        logger.error("Error processing line %r: %s", raw[:200], e)
 
 
-# --------------------------------------------------------------------------
-# Log follower — follows the live file with log rotation handling
-# --------------------------------------------------------------------------
+def _read_lines(f, ino: int, final: bool = False) -> None:
+    """Processes the complete lines available in f, keeping log_pos after the
+    last processed one. A trailing line without newline is still being
+    written: it is left for the next read, unless final (file rotated away)."""
+    while not _shutdown:
+        start = f.tell()
+        raw = f.readline()
+        if not raw:
+            return
+        if not raw.endswith(b"\n") and not final:
+            f.seek(start)
+            return
+        log_pos["ino"], log_pos["pos"] = ino, f.tell()
+        _process_bytes(raw)
+        _maybe_save()
+
+
+def _find_rotated(log_path: str, ino: int) -> Optional[str]:
+    # The file we were reading when the daemon stopped, renamed by logrotate
+    # (eduvpn.log-YYYYMMDD; delaycompress keeps the first rotation uncompressed).
+    # ponytail: compressed (.gz) rotations are not searched; a downtime spanning
+    # two rotations loses the tail of the older file.
+    d = os.path.dirname(log_path) or "."
+    base = os.path.basename(log_path)
+    try:
+        for e in os.scandir(d):
+            if e.name.startswith(base) and e.name != base and e.is_file() and e.inode() == ino:
+                return e.path
+    except OSError:
+        pass
+    return None
+
+
+def _catch_up_rotated(log_path: str) -> None:
+    # On start, if the saved position belongs to a file that has since been
+    # rotated, finish reading that file before switching to the current one.
+    ino = log_pos["ino"]
+    try:
+        if os.stat(log_path).st_ino == ino:
+            return
+    except FileNotFoundError:
+        pass
+    old = _find_rotated(log_path, ino)
+    if old is None:
+        logger.warning("Saved log position is in a file no longer found; reading %s from the start", log_path)
+        return
+    logger.info("Log rotated while stopped: reading the rest of %s", old)
+    with open(old, "rb") as f:
+        f.seek(log_pos["pos"])
+        _read_lines(f, ino, final=True)
+
+
 def follow_log(log_path: str) -> None:
+    # Where to start the first open: the saved position if it belongs to this
+    # file, else the start of the file (new since the saved position). Only
+    # without any saved position (first run) the existing lines are skipped.
+    first = True
+    if log_pos:
+        _catch_up_rotated(log_path)
     while not _shutdown:
         try:
-            with open(log_path, "r", encoding="utf-8") as f:
-                f.seek(0, 2)  # start from the end of the current file
-                logger.info("Following log: %s", log_path)
-                current_ino = os.fstat(f.fileno()).st_ino
+            with open(log_path, "rb") as f:
+                st = os.fstat(f.fileno())
+                ino = st.st_ino
+                if first and not log_pos:
+                    f.seek(0, 2)
+                elif first and log_pos.get("ino") == ino and log_pos["pos"] <= st.st_size:
+                    f.seek(log_pos["pos"])
+                first = False
+                log_pos["ino"], log_pos["pos"] = ino, f.tell()
+                logger.info("Following %s from byte %d", log_path, f.tell())
 
                 while not _shutdown:
-                    line = f.readline()
-                    if not line:
-                        time.sleep(0.3)
-                        # Check whether the file was rotated (inode changed) or
-                        # truncated in place (logrotate copytruncate: same inode,
-                        # size below our offset — readline() would block forever).
-                        try:
-                            st = os.stat(log_path)
-                            if st.st_ino != current_ino:
-                                logger.info("Log rotated, reopening file")
-                                break
-                            if st.st_size < f.tell():
-                                logger.info("Log truncated, reopening file")
-                                break
-                        except FileNotFoundError:
+                    _read_lines(f, ino)
+                    if _shutdown:
+                        break
+                    retry_starts()
+                    _maybe_save(force=True)
+                    time.sleep(POLL_SEC)
+                    # Rotated (inode changed or file gone): drain what was still
+                    # appended to the old file, then reopen. Truncated in place
+                    # (copytruncate: size below our offset): reopen from 0.
+                    try:
+                        st = os.stat(log_path)
+                        if st.st_ino != ino:
+                            logger.info("Log rotated, reopening")
+                            _read_lines(f, ino, final=True)
                             break
-                        continue
-                    process_line(line)
-
+                        if st.st_size < f.tell():
+                            logger.info("Log truncated, reopening")
+                            break
+                    except FileNotFoundError:
+                        _read_lines(f, ino, final=True)
+                        break
         except FileNotFoundError:
+            first = False  # when it appears, all of its content is new
             logger.warning("Log file not found: %s — retrying in 10s", log_path)
-            time.sleep(10)
+            _sleep(10)
         except Exception as e:
             logger.error("Error in log follower: %s — retrying in 5s", e)
-            time.sleep(5)
+            _sleep(5)
+
+
+def _sleep(seconds: float) -> None:
+    end = time.monotonic() + seconds
+    while not _shutdown and time.monotonic() < end:
+        time.sleep(POLL_SEC)
+
+
+# --------------------------------------------------------------------------
+# Shutdown
+# --------------------------------------------------------------------------
+def _handle_signal(signum, frame) -> None:
+    # Only a flag: the main loop finishes the current line, then stop_all() runs.
+    global _shutdown
+    _shutdown = True
+
+
+def stop_all() -> None:
+    # Save first (sessions kept: they are re-started on the next run), then
+    # tell FortiGate the mappings are gone. If FortiGate does not answer, stop
+    # trying: TimeoutStopSec would kill us anyway.
+    _save_state()
+    if sessions:
+        logger.info("Shutdown: sending Accounting-Stop for %d session(s)", len(sessions))
+    for conn, sess in list(sessions.items()):
+        if not _stop(conn, sess, "shutdown"):
+            logger.warning("FortiGate not answering: remaining sessions not stopped")
+            break
 
 
 # --------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------
-def _parse_config(parser: configparser.ConfigParser, config_path: str) -> Dict[str, str]:
-    """Builds the cfg dict from a loaded ConfigParser.
+def _config_error(msg: str, *args) -> NoReturn:
+    logger.error(msg, *args)
+    sys.exit(EXIT_CONFIG)
 
-    A missing [radius]/[eduvpn] section or a required key is a user config
-    error, not a bug — report it cleanly and exit rather than crashing with
-    a raw traceback.
-    """
+
+def _parse_config(parser: configparser.ConfigParser, config_path: str) -> Dict[str, str]:
     try:
-        return {
-            "server":         parser.get("radius", "server"),
-            "port":           parser.get("radius", "port", fallback="1813"),
-            "secret":         parser.get("radius", "secret"),
-            "nas_identifier": parser.get("radius", "nas_identifier", fallback=socket.gethostname()),
-            "log_path":       parser.get("eduvpn", "log_path", fallback=DEFAULT_LOG),
-            "state_path":     parser.get("eduvpn", "state_path", fallback=DEFAULT_STATE),
+        c = {
+            "server":         parser.get("radius", "server").strip(),
+            "port":           parser.get("radius", "port", fallback="1813").strip(),
+            "secret":         parser.get("radius", "secret").strip(),
+            "nas_identifier": parser.get("radius", "nas_identifier", fallback="").strip() or socket.gethostname(),
+            "log_path":       parser.get("eduvpn", "log_path", fallback=DEFAULT_LOG).strip(),
+            "state_path":     parser.get("eduvpn", "state_path", fallback=DEFAULT_STATE).strip(),
         }
     except configparser.Error as e:
-        logger.error("Invalid configuration in %s: %s", config_path, e)
+        _config_error("Invalid configuration in %s: %s", config_path, e)
+    if not c["server"]:
+        _config_error("%s: [radius] server is empty", config_path)
+    if not c["port"].isdigit() or not 0 < int(c["port"]) < 65536:
+        _config_error("%s: [radius] port must be a number between 1 and 65535", config_path)
+    if not c["secret"] or c["secret"].startswith("CHANGE_ME"):
+        _config_error("%s: [radius] secret is not set (still the placeholder?)", config_path)
+    return c
+
+
+def _load_config(config_path: str) -> Dict[str, str]:
+    parser = configparser.ConfigParser()
+    try:
+        read_ok = parser.read(config_path)
+    except configparser.Error as e:
+        _config_error("Invalid configuration syntax in %s: %s", config_path, e)
+    if not read_ok:
+        _config_error("Could not read configuration file: %s", config_path)
+    return _parse_config(parser, config_path)
+
+
+def _make_client() -> "Client":
+    if not os.path.isfile(DICT_PATH):
+        logger.error("RADIUS dictionary not found: %s", DICT_PATH)
         sys.exit(1)
+    try:
+        client = Client(server=cfg["server"], authport=1812, acctport=int(cfg["port"]),
+                        secret=cfg["secret"].encode(), dict=Dictionary(DICT_PATH))
+    except Exception as e:
+        logger.error("Could not initialize RADIUS client: %s", e)
+        sys.exit(1)
+    client.timeout = 5
+    client.retries = 2
+    return client
+
+
+def run_test(ip: str) -> int:
+    """Sends a Start and, after ENTER, the matching Stop for a test user."""
+    ip = _ip(ip)
+    if ip == "-":
+        logger.error("--test needs a valid IPv4 or IPv6 address")
+        return EXIT_CONFIG
+    v6 = ":" in ip
+    sess = {"user": "eduvpn-radius-test", "ip4": "-" if v6 else ip, "ip6": ip if v6 else "-",
+            "profile": "test", "acct_session_id": _make_session_id()}
+    print(f"Accounting-Start user={sess['user']} ip={ip} to {cfg['server']}:{cfg['port']} "
+          f"(NAS-Identifier={cfg['nas_identifier']})")
+    if not _send(START, sess):
+        print("FAILED: no answer. Check address, port, shared secret and that FortiGate accepts RADIUS accounting from this host.")
+        return 1
+    print("OK: FortiGate answered. Its RSSO user list should now map the test user to that IP.")
+    try:
+        input("Press ENTER to send the Accounting-Stop... ")
+    except EOFError:
+        pass
+    ok = _send(STOP, sess)
+    print("OK: Stop answered, the entry should be gone." if ok else "FAILED: no answer to the Stop.")
+    return 0 if ok else 1
 
 
 # --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
 def main() -> None:
-    global cfg, radius_client, sessions, state_path
+    global cfg, radius_client, state_path
 
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S",
+        format="%(levelname)s %(message)s",  # journald adds time and identifier
         stream=sys.stdout,
     )
+    ap = argparse.ArgumentParser(description="eduVPN → FortiGate RSSO RADIUS Accounting daemon")
+    ap.add_argument("config", nargs="?", default=DEFAULT_CONFIG)
+    ap.add_argument("--test", metavar="IP", help="send one test Accounting-Start/Stop for IP and exit")
+    args = ap.parse_args()
 
     if not HAS_PYRAD:
         logger.error("pyrad is not installed. Install it with: apt install python3-pyrad")
         sys.exit(1)
 
-    config_path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_CONFIG
+    cfg = _load_config(args.config)
+    radius_client = _make_client()
+    if args.test:
+        sys.exit(run_test(args.test))
 
-    parser = configparser.ConfigParser()
-    try:
-        read_ok = parser.read(config_path)
-    except configparser.Error as e:
-        logger.error("Invalid configuration syntax in %s: %s", config_path, e)
-        sys.exit(1)
-    if not read_ok:
-        logger.error("Could not read configuration file: %s", config_path)
-        sys.exit(1)
-
-    cfg = _parse_config(parser, config_path)
     state_path = cfg["state_path"]
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
 
-    if not os.path.isfile(DICT_PATH):
-        logger.error("RADIUS dictionary not found: %s", DICT_PATH)
-        sys.exit(1)
-
-    try:
-        d = Dictionary(DICT_PATH)
-        radius_client = Client(
-            server=cfg["server"],
-            authport=1812,
-            acctport=int(cfg["port"]),
-            secret=cfg["secret"].encode(),
-            dict=d,
-        )
-        radius_client.timeout = 5
-        radius_client.retries = 2
-    except Exception as e:
-        logger.error("Could not initialize RADIUS client: %s", e)
-        sys.exit(1)
-
-    signal.signal(signal.SIGTERM, _handle_shutdown)
-    signal.signal(signal.SIGINT, _handle_shutdown)
-
-    sessions = _load_state()
-    recover_sessions()
-
+    _load_state()
+    logger.info("Started: FortiGate %s:%s, %d session(s) restored", cfg["server"], cfg["port"], len(sessions))
     follow_log(cfg["log_path"])
+    stop_all()
 
 
 if __name__ == "__main__":

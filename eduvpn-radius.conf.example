@@ -7,7 +7,7 @@ server = 203.0.113.1
 port = 1813
 
 # Shared secret configured on the FortiGate RSSO agent (External Connector).
-# CHANGE THIS before starting the service. Generate one with:
+# Must be changed: the daemon refuses to start with this placeholder. Generate one with:
 #   openssl rand -base64 24
 secret = CHANGE_ME_use_a_long_random_secret
 
@@ -20,5 +20,5 @@ secret = CHANGE_ME_use_a_long_random_secret
 # compatible tool). Default matches a stock eduvpn-logger install.
 log_path = /var/log/eduvpn/eduvpn.log
 
-# State file used to persist active sessions across daemon restarts.
+# Active sessions and the position reached in log_path, kept across restarts.
 state_path = /var/lib/eduvpn-radius/state.json

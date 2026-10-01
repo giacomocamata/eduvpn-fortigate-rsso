@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # One-command installer for eduvpn-radius (FortiGate RSSO accounting daemon).
-# Idempotent: safe to re-run. Never overwrites an already-configured conf file.
+# Idempotent: safe to re-run. Never overwrites an existing configuration.
 set -euo pipefail
 
 LIBDIR=/usr/local/lib/eduvpn-radius
 ETCDIR=/etc/eduvpn-radius
-STATEDIR=/var/lib/eduvpn-radius
 UNITS=/etc/systemd/system
 CONF="$ETCDIR/eduvpn-radius.conf"
 SRC="$(cd "$(dirname "$0")" && pwd)"
@@ -16,81 +15,56 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 echo "==> Installing dependencies"
-PYRAD_OK=0
 if command -v apt-get >/dev/null 2>&1; then
     apt-get update -qq || true
-    if apt-get install -y python3-pyrad; then
-        PYRAD_OK=1
-    fi
+    apt-get install -y python3 python3-pyrad || true
 elif command -v dnf >/dev/null 2>&1; then
-    if dnf install -y python3-pyrad; then
-        PYRAD_OK=1
-    fi
-else
-    echo "WARN: no apt/dnf found — install pyrad manually (pip3 install pyrad)" >&2
+    dnf install -y python3 python3-pyrad || true
 fi
-
-if [ "$PYRAD_OK" -ne 1 ]; then
-    echo "WARN: distro package for pyrad unavailable — falling back to pip3 install pyrad" >&2
-    pip3 install pyrad || echo "WARN: pip3 install pyrad failed — install it manually before starting the service" >&2
+if ! python3 -c 'import pyrad' 2>/dev/null; then
+    echo "WARN: no pyrad package — trying pip3 install pyrad" >&2
+    pip3 install pyrad || true
 fi
+python3 -c 'import pyrad' 2>/dev/null || { echo "ERROR: Python module pyrad not available — install it, then re-run" >&2; exit 1; }
 
-echo "==> Installing daemon files to $LIBDIR"
-mkdir -p "$LIBDIR"
+echo "==> Installing the daemon to $LIBDIR"
+install -d -m 0755 "$LIBDIR"
 install -m 0755 "$SRC/eduvpn-radius.py" "$LIBDIR/eduvpn-radius.py"
 install -m 0644 "$SRC/dictionary" "$LIBDIR/dictionary"
-install -m 0644 "$SRC/README.md" "$LIBDIR/README.md"
+rm -f "$LIBDIR/README.md"   # installed by older versions
 
-echo "==> Installing systemd unit to $UNITS"
+echo "==> Installing the systemd unit to $UNITS"
+# The unit is overwritten on re-run: customise it with `systemctl edit
+# eduvpn-radius` (drop-ins survive), not by editing the file.
 install -m 0644 "$SRC/systemd/eduvpn-radius.service" "$UNITS/eduvpn-radius.service"
-
-echo "==> Creating runtime directories"
-mkdir -p "$ETCDIR" "$STATEDIR"
-
-CONF_EXISTED=0
-if [ -f "$CONF" ]; then
-    CONF_EXISTED=1
-    echo "==> Existing configuration found at $CONF — leaving it untouched"
-else
-    echo "==> No configuration found — installing example template"
-    install -m 0640 "$SRC/eduvpn-radius.conf.example" "$CONF"
-fi
-
-echo "==> Reloading systemd"
 systemctl daemon-reload
 
-if [ "$CONF_EXISTED" -eq 1 ]; then
-    echo "==> Existing configuration detected — enabling and (re)starting the service"
-    systemctl enable --now eduvpn-radius.service
-else
-    echo "==> Fresh install — service NOT started (placeholder configuration would fail)"
-fi
+install -d -m 0750 "$ETCDIR"
+if [ -f "$CONF" ]; then
+    echo "==> Keeping the existing configuration $CONF"
+    systemctl enable eduvpn-radius.service
+    # restart, not just start: on an upgrade the old code must not keep running
+    systemctl restart eduvpn-radius.service
+    cat <<'EOF'
 
-cat <<'EOF'
-
-==> Done.
-
-NEXT STEPS:
-EOF
-
-if [ "$CONF_EXISTED" -eq 0 ]; then
-cat <<EOF
-1. Edit $CONF — set the real FortiGate address and shared secret:
-     sudo nano $CONF
-   (mode is already 640; keep the secret non-world-readable)
-
-2. Configure the RSSO agent on the FortiGate side — see README.md,
-   "Post-install steps" section.
-
-3. Start the daemon once configured:
-     sudo systemctl enable --now eduvpn-radius.service
-     sudo journalctl -u eduvpn-radius -f
-EOF
-else
-cat <<'EOF'
-Configuration already present — service (re)started with the existing config.
-Check status with:
-  sudo systemctl status eduvpn-radius.service
+==> Done. eduvpn-radius restarted with the existing configuration:
   sudo journalctl -u eduvpn-radius -f
+EOF
+else
+    install -m 0640 "$SRC/eduvpn-radius.conf.example" "$CONF"
+    cat <<EOF
+
+==> Done. The service is NOT started yet: $CONF is a template.
+
+Remaining steps (see README, "Installation"):
+
+1. Set the FortiGate address and the shared secret:
+     sudo nano $CONF
+
+2. Configure the RSSO agent on FortiGate with the same secret.
+
+3. Check the path end to end, then start the daemon:
+     sudo $LIBDIR/eduvpn-radius.py --test <unused IP of the VPN pool>
+     sudo systemctl enable --now eduvpn-radius.service
 EOF
 fi

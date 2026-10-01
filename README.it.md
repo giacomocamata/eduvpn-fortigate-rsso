@@ -1,389 +1,270 @@
 # eduvpn-fortigate-rsso
 
-*🇬🇧 [Read in English](README.md) (versione principale)*
+*🇬🇧 [Read in English](README.md)*
 
-**Ponte RADIUS Accounting dalle sessioni WireGuard eduVPN alle firewall policy identity-based FortiGate RSSO.**
+**Identità utente delle sessioni WireGuard di [eduVPN](https://www.eduvpn.org/) su un FortiGate, tramite RADIUS Accounting (RSSO).**
 
-## Motivazione
+Quando un server eduVPN inoltra il traffico dei client a un FortiGate senza NAT,
+il FortiGate vede l'indirizzo di tunnel di ogni client (es. `10.20.0.5`) ma non
+l'utente che c'è dietro: log e policy possono lavorare solo per pool di
+indirizzi. Il **RADIUS Single Sign-On (RSSO)** di FortiGate colma questa lacuna:
+impara le coppie *utente ↔ IP* dai pacchetti standard RADIUS
+Accounting-Start/Stop (RFC 2866) inviati da un NAS.
 
-In un deployment eduVPN **No-NAT**, i pacchetti dei client VPN raggiungono il
-FortiGate con l'IP reale del pool VPN come sorgente (es. `10.20.0.5`).
-FortiGate non ha un'integrazione nativa con eduVPN, quindi di default le sue
-firewall policy e i suoi log vedono solo un indirizzo IP — mai l'utente
-dietro di esso. È una lacuna reale per audit, incident response e controllo
-degli accessi basato sull'identità.
-
-FortiGate conosce però un meccanismo standard per questo: **RADIUS
-Accounting** (RFC 2866). Il suo agente RSSO (RADIUS Single Sign-On) resta in
-ascolto di pacchetti Accounting-Start/Stop da un NAS e costruisce una tabella
-di mapping utente↔IP interna, che le firewall policy possono referenziare
-direttamente.
-
-`eduvpn-fortigate-rsso` è un piccolo daemon che si comporta come quel NAS:
-segue il log di sessione unificato prodotto da
-[eduvpn-logger](https://github.com/giacomocamata/eduvpn-logger) (o qualunque
-correlatore che emetta lo stesso formato di log `event=`) e trasforma gli
-eventi `connect`/`disconnect` in pacchetti RADIUS Accounting-Start/Stop
-inviati al tuo FortiGate.
+`eduvpn-radius` è quel NAS. Segue il log di sessione scritto da
+[eduvpn-logger](https://github.com/giacomocamata/eduvpn-logger) e trasforma ogni
+`connect` in un Accounting-Start e ogni `disconnect` nell'Accounting-Stop
+corrispondente:
 
 ```
-gateway eduVPN (vpn.example.org)             FortiGate
-─────────────────────────────                ─────────
-correlatore → /var/log/eduvpn/eduvpn.log
-                    ↓
-            eduvpn-radius.py
-                    ↓ UDP/1813
-              Acct-Start/Stop  ──────────→ tabella RSSO
-                                           user alice → 10.20.0.5
-                                           user alice → 2001:db8:1234:5678::5
-                                           ↓
-                                     firewall policy
-                                     src: 10.20.0.0/22
-                                     identità: user → log/ACL
+eduvpn.log   2026-04-15T09:58:03.412871+02:00 event=connect user=alice profile=staff device=ios conn=soAQTNO...= tunnel_ip4="10.20.0.5" tunnel_ip6="fd00:20::5" ...
+  →  Accounting-Start  User-Name=alice  Framed-IP-Address=10.20.0.5  Framed-IPv6-Address=fd00:20::5  Called-Station-Id=staff  Acct-Session-Id=3f9c0a1be47d2c55
+
+eduvpn.log   2026-04-15T11:02:57.731204+02:00 event=disconnect user=alice profile=staff device=ios conn=soAQTNO...= ...
+  →  Accounting-Stop   User-Name=alice  Framed-IP-Address=10.20.0.5  Framed-IPv6-Address=fd00:20::5  Called-Station-Id=staff  Acct-Session-Id=3f9c0a1be47d2c55
 ```
 
-## Punti salienti del design
-
-Estratto da un deployment universitario in produzione e generalizzato.
-Alcune scelte degne di nota:
-
-- **Persistenza delle sessioni con recovery crash-safe.** Le sessioni attive
-  vengono serializzate in un file di stato JSON dopo ogni evento (scrittura
-  atomica: file temporaneo + `os.replace`). Al riavvio il daemon re-invia
-  Accounting-Start per ogni sessione persistita, così un riavvio del daemon
-  non lascia mai la tabella RSSO del FortiGate non aggiornata.
-- **Il roaming non genera traffico RADIUS.** L'IP VPN assegnato a un client
-  WireGuard non cambia mai durante il roaming (es. WiFi → LTE) — cambia solo
-  il suo IP sorgente esterno. Il mapping user→VPN_IP sul FortiGate resta
-  valido, quindi `event=roam` non genera alcun traffico RADIUS.
-- **Gestione della riconnessione rapida.** Se arriva un `connect` per un peer
-  WireGuard che ha già una sessione attiva (stessa public key), il daemon
-  chiude prima la vecchia sessione (Accounting-Stop) e poi apre la nuova —
-  nessuna entry orfana nella tabella del FortiGate.
-- **Gestione del riuso degli IP del pool.** Il pool VPN riassegna gli IP
-  liberati. Se un `connect` assegna un IP che un'altra sessione tracciata
-  detiene ancora — segno che il suo disconnect è andato perso, es. mentre il
-  daemon era fermo — quella sessione è provabilmente morta e viene chiusa
-  subito (Accounting-Stop), così il suo vecchio mapping user→IP non può mai
-  essere ripristinato al posto di quello del nuovo utente durante il recovery.
-- **Arresto graceful.** Su SIGTERM/SIGINT il daemon invia Accounting-Stop per
-  tutte le sessioni attive prima di uscire, così un riavvio o arresto
-  pianificato non lascia mai entry RSSO obsolete (`TimeoutStopSec=30` nella
-  unit systemd gli dà il tempo di farlo).
-- **Nessuna identità di sito incorporata.** `NAS-Identifier` usa di default
-  l'hostname locale se non impostato esplicitamente in configurazione — nulla
-  di specifico al sito è hardcoded nello script.
+È un daemon Python in un solo file (standard library + `pyrad`), in produzione
+all'Università di Trieste accanto a eduvpn-logger.
 
 ## Come funziona
 
-| Evento correlatore | Azione RADIUS | Motivo |
+Le sessioni sono identificate dalla **public key WireGuard** (`conn`), la stessa
+chiave usata da eduvpn-logger:
+
+| Evento nel log | RADIUS | Note |
 |---|---|---|
-| `event=connect` | Accounting-Start | Nuova sessione VPN, IP assegnato |
-| `event=disconnect` | Accounting-Stop | Sessione terminata, rimuovere il mapping |
-| `event=roam` | nessuna | L'IP VPN non cambia durante il roaming; solo l'IP sorgente esterno |
+| `connect` | Accounting-Start | nuovo session id; se la stessa sessione viene annunciata di nuovo (eduvpn-logger lo fa dopo un proprio riavvio) lo Start viene re-inviato con lo stesso id, senza Stop |
+| `connect`, stessa chiave, nuovo IP di tunnel | Stop, poi Start | la sessione vecchia viene chiusa prima |
+| `connect` con un IP di tunnel tenuto da un'altra sessione | Stop per l'altra, poi Start | il pool ha riassegnato l'indirizzo: il disconnect dell'altra sessione è andato perso e la sessione è finita |
+| `disconnect` | Accounting-Stop | stesso `Acct-Session-Id` dello Start |
+| `roam` | nessuno | l'IP di tunnel non cambia, cambia solo l'indirizzo pubblico di provenienza |
+| `connect` con `user=-` o senza IP di tunnel | nessuno | nulla che il FortiGate possa usare |
 
-Ogni sessione attiva è tracciata in memoria (e persistita nel file di stato),
-con chiave la public key WireGuard (`conn`):
+Il daemon conserva le sessioni e la posizione raggiunta nel log in
+`/var/lib/eduvpn-radius/state.json`:
 
-```json
-{
-  "ABCDEF123...": {
-    "user": "alice",
-    "ip4": "10.20.0.5",
-    "ip6": "2001:db8:1234:5678::5",
-    "profile": "staff",
-    "acct_session_id": "a1b2c3d4e5f60001"
-  }
-}
-```
-
-`acct_session_id` (un UUID hex a 16 caratteri) permette al FortiGate di
-abbinare un Accounting-Stop al corretto Accounting-Start, anche con sessioni
-concorrenti dello stesso utente su profili diversi. È usato internamente e
-non compare nella dashboard FortiGate — è normale.
+- **Riavvii.** Allo stop invia un Accounting-Stop per ogni sessione aperta, così
+  il FortiGate non tiene una coppia *utente ↔ IP* stantia mentre nessuno la
+  aggiorna. All'avvio legge prima ciò che è stato scritto nel log mentre era
+  fermo (anche attraverso una rotazione), poi re-invia l'Accounting-Start delle
+  sessioni ancora aperte, con i loro session id originali.
+- **FortiGate irraggiungibile.** Uno Start senza risposta viene ritentato ogni
+  30 s finché il FortiGate risponde. Gli Stop non vengono ritentati (vedi
+  [Limiti](#limiti)).
+- **Rotazione del log.** Le rotazioni `create` e `copytruncate` vengono seguite
+  per nome, e nessuna riga scritta a cavallo di una rotazione viene saltata.
 
 ## Requisiti
 
-- Linux con `systemd`.
-- Python 3.9+ e [`pyrad`](https://github.com/pyradius/pyrad) (installato
-  automaticamente da `install.sh`).
-- Un correlatore che produca il formato di log `event=connect|roam|disconnect`
-  — ad es. [eduvpn-logger](https://github.com/giacomocamata/eduvpn-logger).
-- Un FortiGate con supporto RSSO (testato su FortiOS 7.4.x).
+- Un server eduVPN con **[eduvpn-logger](https://github.com/giacomocamata/eduvpn-logger)**
+  installato e attivo (o un altro strumento che scriva le stesse righe `event=`
+  in `/var/log/eduvpn/eduvpn.log`).
+- Linux con systemd, Python ≥ 3.9 e [`pyrad`](https://github.com/pyradius/pyrad)
+  (`python3-pyrad` su Debian/Ubuntu, installato da `install.sh`).
+- Un FortiGate con RSSO, raggiungibile su UDP 1813 dal server eduVPN. Testato
+  con FortiOS 7.4.
+- Un'architettura instradata (No-NAT): il FortiGate deve vedere gli indirizzi di
+  tunnel come sorgente del traffico dei client, altrimenti la mappatura non ha
+  nulla a cui applicarsi.
 
-## Avvio rapido
+## Installazione
+
+### 1. eduvpn-logger
+
+Installare eduvpn-logger e verificare che, quando un client si connette, in
+`/var/log/eduvpn/eduvpn.log` compaiano righe `connect` con l'utente e gli IP di
+tunnel. eduvpn-radius legge solo quel file.
+
+### 2. Installare il daemon
 
 ```bash
 git clone https://github.com/giacomocamata/eduvpn-fortigate-rsso.git
 cd eduvpn-fortigate-rsso
-chmod +x install.sh
 sudo ./install.sh
 ```
 
-`install.sh` è idempotente. Su un'**installazione pulita** non avvia il
-servizio — viene installata solo una configurazione placeholder (nessun
-secret reale funzionerebbe), quindi installa `eduvpn-radius.conf.example`
-come tua config e stampa i passaggi successivi qui sotto. Su un **re-run** in
-cui esiste già una config reale, la lascia intatta e (ri)avvia il servizio.
+`install.sh` è idempotente e fa quanto segue:
 
-## Passaggi post-installazione
+| Elemento | Percorso |
+|---|---|
+| pacchetti | `python3`, `python3-pyrad` (ripiego su pip se il pacchetto manca) |
+| programma | `/usr/local/lib/eduvpn-radius/eduvpn-radius.py` e il suo `dictionary` RADIUS |
+| unit systemd | `/etc/systemd/system/eduvpn-radius.service` |
+| configurazione | `/etc/eduvpn-radius/eduvpn-radius.conf`, `0640`, solo se assente |
+| stato | `/var/lib/eduvpn-radius` (creata da systemd, `0700`) |
 
-### 1. Modificare la configurazione
+Alla prima installazione la configurazione è un modello con valori segnaposto e
+il servizio **non** viene avviato. Se una configurazione esiste già, viene
+mantenuta e il servizio viene riavviato.
+
+<details>
+<summary>Installazione manuale (senza <code>install.sh</code>)</summary>
+
+```bash
+sudo apt install -y python3 python3-pyrad      # dnf su Fedora/EL
+sudo install -d -m 0755 /usr/local/lib/eduvpn-radius
+sudo install -m 0755 eduvpn-radius.py /usr/local/lib/eduvpn-radius/
+sudo install -m 0644 dictionary /usr/local/lib/eduvpn-radius/
+sudo install -m 0644 systemd/eduvpn-radius.service /etc/systemd/system/
+sudo install -d -m 0750 /etc/eduvpn-radius
+sudo install -m 0640 eduvpn-radius.conf.example /etc/eduvpn-radius/eduvpn-radius.conf
+sudo systemctl daemon-reload
+```
+
+</details>
+
+### 3. Configurare
 
 ```bash
 sudo nano /etc/eduvpn-radius/eduvpn-radius.conf
 ```
 
-Imposta `server` con l'IP reale del tuo FortiGate e genera un `secret` reale
-(`openssl rand -base64 24`). Vedi
-[Riferimento configurazione](#riferimento-configurazione) per tutte le chiavi.
+Impostare `server` all'indirizzo del FortiGate a cui inviare i pacchetti RADIUS
+e `secret` a un nuovo valore casuale (`openssl rand -base64 24`). Il daemon
+rifiuta di partire finché il secret è ancora il segnaposto. Tutte le chiavi sono
+descritte in [Configurazione](#configurazione).
 
-### 2. Configurare FortiGate per usare i dati di accounting
+### 4. Configurare il FortiGate
 
-Il compito di questo daemon è unicamente parlare RADIUS Accounting standard
-(RFC 2866) con FortiGate; il modo in cui FortiGate trasforma questo in
-firewall policy identity-aware si configura interamente lato FortiGate,
-tramite la sua funzione RADIUS Single Sign-On (RSSO), ed è indipendente da
-questa repository.
+Il lato FortiGate si configura sul FortiGate stesso, con RSSO. Menu e comandi
+cambiano tra le versioni di FortiOS, quindi non sono riportati qui. A livello
+concettuale servono quattro cose:
 
-A livello concettuale, quattro cose devono esistere su FortiGate —
-indipendentemente dalla versione FortiOS o dal layout della GUI:
+1. **Accounting RADIUS accettato** sull'interfaccia rivolta al server eduVPN,
+   sulla porta configurata (UDP 1813 di default).
+2. **Un agente RSSO** con lo stesso shared secret di `eduvpn-radius.conf`,
+   impostato per leggere l'indirizzo del client da `Framed-IP-Address` e il
+   gruppo da `Called-Station-Id` (vedi [Attributi RADIUS](#attributi-radius)).
+3. **Un gruppo utenti RSSO** che fa riferimento a quell'agente.
+4. **Policy firewall** per i pool di indirizzi della VPN che usano quel gruppo,
+   così che i loro log riportino il nome utente. Il gruppo può servire anche a
+   filtrare gli accessi.
 
-1. **Ricezione accounting** sull'interfaccia rivolta verso questo daemon, per
-   la porta configurata in `eduvpn-radius.conf` (default UDP 1813).
-2. **Un agente RSSO** (un "RADIUS Single Sign-On agent" / External Connector
-   in FortiOS), configurato con lo stesso `secret` condiviso di questo
-   daemon, e a cui viene detto quale attributo RADIUS porta l'IP del client
-   e quale il suo gruppo/contesto — vedi
-   [Dati inviati a FortiGate](#dati-inviati-a-fortigate) qui sotto per gli
-   attributi esatti che questo daemon popola.
-3. **Un gruppo utenti** di tipo RSSO che referenzia quell'agente, così le
-   firewall policy possono selezionare "tutti gli utenti riportati da
-   questo daemon".
-4. **Una firewall policy** la cui sorgente copre i tuoi pool di indirizzi
-   VPN e che referenzia quel gruppo RSSO, rendendo identity-aware i suoi log
-   e il controllo degli accessi.
+Vedere la documentazione Fortinet per la propria versione di FortiOS, ad es.
+[Configuring RADIUS SSO authentication](https://docs.fortinet.com/document/fortigate/7.6.2/administration-guide/513092/configuring-radius-sso-authentication)
+nella [Fortinet Document Library](https://docs.fortinet.com/).
 
-I comandi CLI esatti e le schermate GUI per questi passaggi cambiano tra le
-varie release di FortiOS, quindi questo README non ne mantiene
-deliberatamente una copia — segui invece la documentazione ufficiale di
-Fortinet, allineata alla tua versione:
+### 5. Verifica
 
-- [Fortinet Document Library](https://docs.fortinet.com/) — cerca "RADIUS
-  Single Sign-On" o "RSSO agent" per la tua versione FortiOS
-- ad es. [Configuring RADIUS SSO authentication (FortiOS 7.6)](https://docs.fortinet.com/document/fortigate/7.6.2/administration-guide/513092/configuring-radius-sso-authentication)
+Per prima cosa verificare il percorso verso il FortiGate con una sessione di
+prova: usare un indirizzo del pool VPN non in uso.
 
-## Riferimento configurazione
+```bash
+sudo /usr/local/lib/eduvpn-radius/eduvpn-radius.py --test 10.20.0.250
+```
 
-`eduvpn-radius.conf` è un file INI (vedi
-[`eduvpn-radius.conf.example`](eduvpn-radius.conf.example) per il template
-fornito):
+Invia un Accounting-Start per l'utente `eduvpn-radius-test`, attende INVIO (è il
+momento di controllare che l'utente compaia nella lista utenti RSSO del
+FortiGate), poi invia l'Accounting-Stop. Quindi avviare il servizio e connettere
+un client:
+
+```bash
+sudo systemctl enable --now eduvpn-radius.service
+sudo journalctl -u eduvpn-radius -f
+```
+
+Ogni sessione produce una riga `start(connect) user=… ok=True` e più tardi una
+riga `stop(disconnect) … ok=True`. `ok=True` significa che il FortiGate ha
+risposto.
+
+| Sintomo | Causa probabile |
+|---|---|
+| `secret is not set (still the placeholder?)`, servizio fallito | passo 3 non eseguito |
+| `RADIUS timeout`, `ok=False` | FortiGate non raggiungibile su UDP 1813 da questo host, accounting non accettato su quell'interfaccia, oppure **shared secret diverso** (il FortiGate scarta in silenzio i pacchetti con secret errato) |
+| `ok=True` ma nessun utente sul FortiGate | impostazione degli attributi dell'agente RSSO (`Framed-IP-Address`, `Called-Station-Id`) |
+| utente in lista ma assente da policy/log | la policy non usa il gruppo RSSO, oppure il traffico viene nattato prima del FortiGate |
+| nessuna riga `start` | eduvpn-logger non scrive connect (passo 1), oppure `log_path` errato |
+| `connect without tunnel IP ignored` | eduvpn-logger non ha potuto determinare l'indirizzo di tunnel di quella sessione |
+
+## Configurazione
+
+`/etc/eduvpn-radius/eduvpn-radius.conf` (INI). Dopo una modifica:
+`sudo systemctl restart eduvpn-radius.service`.
 
 | Sezione | Chiave | Default | Significato |
 |---|---|---|---|
-| `[radius]` | `server` | *(obbligatoria)* | IP del FortiGate che riceve i pacchetti Accounting |
-| `[radius]` | `port` | `1813` | Porta RADIUS Accounting |
-| `[radius]` | `secret` | *(obbligatoria)* | Shared secret, deve corrispondere all'agente RSSO FortiGate |
-| `[radius]` | `nas_identifier` | hostname locale | `NAS-Identifier` inviato in ogni pacchetto |
-| `[eduvpn]` | `log_path` | `/var/log/eduvpn/eduvpn.log` | Log del correlatore da seguire |
-| `[eduvpn]` | `state_path` | `/var/lib/eduvpn-radius/state.json` | File di persistenza sessioni |
+| `[radius]` | `server` | *(obbligatoria)* | indirizzo del FortiGate (IP o nome host) |
+| `[radius]` | `port` | `1813` | porta RADIUS accounting |
+| `[radius]` | `secret` | *(obbligatoria)* | shared secret, lo stesso dell'agente RSSO del FortiGate |
+| `[radius]` | `nas_identifier` | nome host | `NAS-Identifier` di ogni pacchetto |
+| `[eduvpn]` | `log_path` | `/var/log/eduvpn/eduvpn.log` | log scritto da eduvpn-logger |
+| `[eduvpn]` | `state_path` | `/var/lib/eduvpn-radius/state.json` | sessioni aperte e posizione nel log |
 
-## Dati inviati a FortiGate
+La unit viene sostituita a ogni reinstallazione. Per modificarla (es. un
+percorso di configurazione diverso) usare un drop-in:
+`sudo systemctl edit eduvpn-radius.service`.
 
-Questo è il contratto dati RADIUS Accounting implementato da questo daemon —
-mappa questi attributi sull'agente RSSO di FortiGate per utilizzarli:
+## Attributi RADIUS
 
-| Parametro | Valore |
+Ogni pacchetto è un Accounting-Request (UDP, porta 1813 di default) con:
+
+| Attributo | Valore |
 |---|---|
-| Porta RADIUS Accounting | UDP `1813` (o la porta configurata) |
-| Attributo endpoint (IP) | `Framed-IP-Address` (+ `Framed-IPv6-Address` per IPv6) |
-| Attributo gruppo/contesto | `Called-Station-Id` (il nome del profilo VPN) |
-| Attributo di abbinamento sessione | `Acct-Session-Id` (abbina ogni Stop al proprio Start) |
+| `Acct-Status-Type` | `Start` (1) o `Stop` (2) |
+| `User-Name` | user ID eduVPN, come scritto da eduvpn-logger |
+| `Framed-IP-Address` | indirizzo IPv4 di tunnel, se presente |
+| `Framed-IPv6-Address` | indirizzo IPv6 di tunnel, se presente (RFC 6911) |
+| `Called-Station-Id` | ID del profilo eduVPN, utilizzabile come gruppo RSSO |
+| `Acct-Session-Id` | 16 caratteri esadecimali, uguale nello Start e nello Stop di una sessione |
+| `NAS-Identifier` | `nas_identifier`, di default il nome host |
+| `Acct-Delay-Time` | solo nelle ritrasmissioni (aggiunto da pyrad) |
 
-## Test di connettività
+Ogni pacchetto viene inviato al massimo due volte, attendendo 5 s
+l'Accounting-Response del FortiGate; senza risposta il daemon registra
+`ok=False`.
 
-Uno script di test minimale invia un Accounting-Start (con IPv4 **e** IPv6),
-si mette in pausa così puoi ispezionare la tabella RSSO del FortiGate, poi
-invia un Accounting-Stop per ripulire:
+## Limiti
+
+- **La mappatura è accurata quanto eduvpn-logger.** Le sessioni che chiude dopo
+  180 s di silenzio negli handshake (disconnect dedotti) lasciano il FortiGate
+  fino a 3 minuti dopo la fine reale del tunnel.
+- **Gli Stop non vengono ritentati.** Uno Stop perso mentre il FortiGate è
+  irraggiungibile lascia la coppia sul FortiGate finché l'indirizzo non viene
+  riassegnato (il nuovo Start la sostituisce) o la voce scade sul FortiGate.
+- **Un riavvio del FortiGate** svuota la sua tabella RSSO; le sessioni aperte
+  tornano al connect successivo o con `systemctl restart eduvpn-radius`.
+- **Mentre il daemon è fermo** il FortiGate non ha coppie per gli utenti VPN;
+  all'avvio gli eventi arretrati vengono rigiocati. Un fermo che copre più di una
+  rotazione del log perde gli eventi del file più vecchio, già compresso.
+- **Primo avvio.** Le sessioni già aperte quando il daemon parte per la prima
+  volta restano sconosciute finché non si riconnettono.
+
+## Sicurezza e privacy
+
+- **Shared secret.** La configurazione è `0640 root:root` in una directory
+  `0750`. L'accounting RADIUS non è cifrato: i nomi utente viaggiano in chiaro
+  verso il FortiGate, quindi quel percorso deve stare su una rete fidata.
+- **Dati personali.** Il file di stato contiene user ID e relativi indirizzi di
+  tunnel (directory `0700`). I log del FortiGate assoceranno il traffico agli
+  utenti: definire finalità e conservazione con il proprio Responsabile della
+  Protezione dei Dati.
+- **Privilegi.** Il servizio gira come root dentro una sandbox systemd, senza
+  capability, con i soli socket IPv4/IPv6/Unix e con `/usr`, `/boot` ed `/etc` in
+  sola lettura. Verifica con `systemd-analyze security eduvpn-radius.service`.
+
+## Aggiornamento e rimozione
+
+Aggiornamento (configurazione e stato vengono mantenuti; il servizio viene
+riavviato):
 
 ```bash
-sudo tee /tmp/radius-test.py > /dev/null << 'PYEOF'
-from pyrad.client import Client, Timeout
-from pyrad.dictionary import Dictionary
-import uuid, sys
-
-FORTIGATE  = "203.0.113.1"
-SECRET     = b"CHANGE_ME_use_a_long_random_secret"
-DICT_PATH  = "/usr/local/lib/eduvpn-radius/dictionary"
-NAS_ID     = "vpn.example.org"
-TEST_USER  = "connectivity_test"
-TEST_IP4   = "10.20.0.99"
-TEST_IP6   = "2001:db8:1234:5678::99"
-TEST_PROF  = "staff"
-SESSION_ID = uuid.uuid4().hex[:16]
-
-d = Dictionary(DICT_PATH)
-c = Client(server=FORTIGATE, authport=1812, acctport=1813, secret=SECRET, dict=d)
-c.timeout = 5
-c.retries = 1
-
-print("[1/2] Accounting-Start")
-print(f"      user={TEST_USER}  ip4={TEST_IP4}  ip6={TEST_IP6}")
-print(f"      profile={TEST_PROF}  session={SESSION_ID}")
-pkt = c.CreateAcctPacket()
-pkt["User-Name"]           = TEST_USER
-pkt["Acct-Status-Type"]    = "Start"
-pkt["Acct-Session-Id"]     = SESSION_ID
-pkt["NAS-Identifier"]      = NAS_ID
-pkt["Framed-IP-Address"]   = TEST_IP4
-pkt["Framed-IPv6-Address"] = TEST_IP6
-pkt["Called-Station-Id"]   = TEST_PROF
-try:
-    c.SendPacket(pkt)
-    print("      OK — Start accepted")
-except Timeout:
-    print("      ERROR Timeout — FortiGate not responding on UDP/1813")
-    print("      Check that the receiving interface accepts RADIUS Accounting")
-    print(f"      Check routing: ip route get {FORTIGATE}")
-    sys.exit(1)
-except Exception as e:
-    print(f"      ERROR: {e}")
-    sys.exit(1)
-
-print()
-print("Now check FortiGate's RSSO / authenticated-users status (GUI or")
-print("diagnostic CLI, per Fortinet's documentation) for a 'connectivity_test'")
-print("entry mapped to the IPs above.")
-print()
-input("Press ENTER to send Accounting-Stop and clean up...")
-print()
-
-print("[2/2] Accounting-Stop")
-print(f"      user={TEST_USER}  ip4={TEST_IP4}  ip6={TEST_IP6}")
-pkt2 = c.CreateAcctPacket()
-pkt2["User-Name"]           = TEST_USER
-pkt2["Acct-Status-Type"]    = "Stop"
-pkt2["Acct-Session-Id"]     = SESSION_ID
-pkt2["NAS-Identifier"]      = NAS_ID
-pkt2["Framed-IP-Address"]   = TEST_IP4
-pkt2["Framed-IPv6-Address"] = TEST_IP6
-try:
-    c.SendPacket(pkt2)
-    print("      OK — Stop accepted. Both entries (IPv4 and IPv6) removed.")
-except Exception as e:
-    print(f"      ERROR on Stop: {e}")
-
-print()
-print("Final check: confirm on FortiGate that the 'connectivity_test' entry")
-print("is now gone from its RSSO / authenticated-users status.")
-PYEOF
-
-python3 /tmp/radius-test.py
+cd eduvpn-fortigate-rsso && git pull && sudo ./install.sh
 ```
 
-Mentre lo script è in pausa tra Start e Stop, gli strumenti di packet
-capture e di diagnostica RSSO/utenti-autenticati di FortiGate (GUI o CLI,
-documentati da Fortinet per la tua versione FortiOS — vedi i link sopra) ti
-permettono di confermare che i pacchetti sono arrivati e che il mapping è
-stato creato, prima che lo Stop lo rimuova di nuovo.
+Il file di stato delle versioni precedenti viene letto così com'è.
 
-## Risoluzione problemi
-
-La maggior parte dei problemi ricade su uno di due lati:
-
-- **Questo daemon non invia, o invia dati sbagliati** — controlla
-  `sudo journalctl -u eduvpn-radius -f`: eventi connect/disconnect, timeout
-  RADIUS ed errori di configurazione sono tutti loggati lì in linguaggio
-  chiaro (vedi
-  [Riferimento configurazione](#riferimento-configurazione)).
-- **FortiGate non li riceve, o non li usa** — usando gli strumenti
-  diagnostici ufficiali di Fortinet per la tua versione FortiOS, verifica
-  che: l'interfaccia di ricezione accetti RADIUS Accounting sulla porta
-  configurata; il secret condiviso dell'agente RSSO corrisponda al `secret`
-  di questo daemon; il mapping degli attributi endpoint/gruppo dell'agente
-  RSSO corrisponda a [Dati inviati a FortiGate](#dati-inviati-a-fortigate);
-  e che la firewall policy referenzi effettivamente il gruppo RSSO.
-
-I comandi esatti di packet-capture, debug RADIUS e stato utenti autenticati
-sono coperti dalla documentazione Fortinet (vedi i link in
-[Passaggi post-installazione](#passaggi-post-installazione)) invece che
-duplicati qui, perché è più probabile che restino accurati tra le release
-FortiOS rispetto a una copia mantenuta in questo README.
-
-### Sintomi comuni
-
-| Sintomo | Lato probabile | Cosa verificare |
-|---|---|---|
-| `RADIUS timeout` nel log del daemon | FortiGate / rete | Ricezione accounting abilitata sull'interfaccia e porta corrette; routing/firewalling tra i due host |
-| Il daemon logga `ok=True` ma su FortiGate non compare nulla | FortiGate | Secret condiviso e mapping attributi dell'agente RSSO |
-| FortiGate mostra l'IP ma nessuna etichetta gruppo/utente | FortiGate | Mapping dell'attributo gruppo/contesto dell'agente RSSO |
-| Le entry non spariscono mai dopo la disconnessione | FortiGate | Comportamento di flush sessione dell'agente RSSO |
-| File di log non trovato all'avvio | Questo daemon / correlatore | Il correlatore (es. eduvpn-logger) non è ancora in esecuzione — il daemon riprova ogni 10s |
-
-## Installazione manuale
+Rimozione:
 
 ```bash
-sudo mkdir -p /usr/local/lib/eduvpn-radius
-sudo install -m 0755 eduvpn-radius.py /usr/local/lib/eduvpn-radius/
-sudo install -m 0644 dictionary README.md /usr/local/lib/eduvpn-radius/
-
-sudo mkdir -p /etc/eduvpn-radius
-sudo install -m 0640 eduvpn-radius.conf.example /etc/eduvpn-radius/eduvpn-radius.conf
-sudo nano /etc/eduvpn-radius/eduvpn-radius.conf   # imposta server + secret reali
-
-sudo mkdir -p /var/lib/eduvpn-radius
-sudo install -m 0644 systemd/eduvpn-radius.service /etc/systemd/system/
-
+sudo systemctl disable --now eduvpn-radius.service
+sudo rm -rf /usr/local/lib/eduvpn-radius /etc/eduvpn-radius /var/lib/eduvpn-radius \
+    /etc/systemd/system/eduvpn-radius.service /etc/systemd/system/eduvpn-radius.service.d
 sudo systemctl daemon-reload
-sudo systemctl enable --now eduvpn-radius.service
 ```
 
-## Considerazioni di sicurezza
-
-Il daemon gira come `root` (deve leggere il log del correlatore, scrivere il
-file di stato e leggere un file di configurazione contenente uno shared
-secret) — coerente con il setup di produzione da cui è stato estratto. Il
-file di configurazione viene installato con `chmod 640` per mantenere il
-secret non leggibile da altri utenti. Per ridurre ulteriormente i privilegi
-del daemon, valuta di aggiungere direttive di hardening systemd alla unit
-(`ProtectSystem=strict`, `ProtectHome=true`,
-`ReadWritePaths=/var/lib/eduvpn-radius`) — non implementate qui, ma un passo
-successivo ragionevole se il tuo modello di minaccia lo richiede.
-
-## Manutenzione
-
-```bash
-# Log in tempo reale
-sudo journalctl -u eduvpn-radius -f
-sudo journalctl -u eduvpn-radius --since "1 hour ago"
-
-# Stato delle sessioni attive
-sudo cat /var/lib/eduvpn-radius/state.json | python3 -m json.tool
-
-# Riavvio (Accounting-Start viene re-inviato automaticamente per tutte le sessioni persistite)
-sudo systemctl restart eduvpn-radius
-
-# Rotazione dello shared secret
-openssl rand -base64 24
-sudo nano /etc/eduvpn-radius/eduvpn-radius.conf   # aggiorna il secret
-sudo systemctl restart eduvpn-radius
-# poi aggiorna lo stesso secret sull'agente RSSO di FortiGate — vedi la
-# documentazione Fortinet (link in "Passaggi post-installazione") per la
-# tua versione FortiOS
-```
-
-## Test
-
-```bash
-python3 test_eduvpn_radius.py
-```
-
-Copre la logica pura che vale la pena proteggere: parsing delle righe di log
-key=value, salvataggio/caricamento atomico dello stato sessioni, sostituzione
-sessione in caso di riconnessione rapida, eviction delle sessioni stantie al
-riuso di un IP del pool, e gestione della disconnessione — senza bisogno di
-installare `pyrad` o di accesso alla rete.
+Poi rimuovere agente RSSO, gruppo e riferimenti nelle policy sul FortiGate.
 
 ## Licenza
 
-MIT — vedi [LICENSE](LICENSE).
+MIT, vedi [LICENSE](LICENSE).

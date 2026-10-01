@@ -39,6 +39,7 @@ chiave usata da eduvpn-logger:
 | `connect` con un IP di tunnel tenuto da un'altra sessione | Stop per l'altra, poi Start | il pool ha riassegnato l'indirizzo: il disconnect dell'altra sessione è andato perso e la sessione è finita |
 | `disconnect` | Accounting-Stop | stesso `Acct-Session-Id` dello Start |
 | `roam` | nessuno | l'IP di tunnel non cambia, cambia solo l'indirizzo pubblico di provenienza |
+| ogni `interim_interval` (1 h) | Interim-Update | per ogni sessione aperta: senza accounting il FortiGate dimentica un utente RSSO dopo il suo `rsso-context-timeout` (8 h di default) |
 | `connect` con `user=-` o senza IP di tunnel | nessuno | nulla che il FortiGate possa usare |
 
 Il daemon conserva le sessioni e la posizione raggiunta nel log in
@@ -50,8 +51,9 @@ Il daemon conserva le sessioni e la posizione raggiunta nel log in
   fermo (anche attraverso una rotazione), poi re-invia l'Accounting-Start delle
   sessioni ancora aperte, con i loro session id originali.
 - **FortiGate irraggiungibile.** Uno Start senza risposta viene ritentato ogni
-  30 s finché il FortiGate risponde. Gli Stop non vengono ritentati (vedi
-  [Limiti](#limiti)).
+  30 s finché il FortiGate risponde. Dopo un timeout i nuovi pacchetti non
+  vengono inviati per 30 s, così un fermo non rallenta il log di 10 s per
+  evento. Gli Stop non vengono ritentati (vedi [Limiti](#limiti)).
 - **Rotazione del log.** Le rotazioni `create` e `copytruncate` vengono seguite
   per nome, e nessuna riga scritta a cavallo di una rotazione viene saltata.
 
@@ -88,7 +90,7 @@ sudo ./install.sh
 
 | Elemento | Percorso |
 |---|---|
-| pacchetti | `python3`, `python3-pyrad` (ripiego su pip se il pacchetto manca) |
+| pacchetti | `python3`, `python3-pyrad` (nessun ripiego su pip: senza il pacchetto l'installer si ferma) |
 | programma | `/usr/local/lib/eduvpn-radius/eduvpn-radius.py` e il suo `dictionary` RADIUS |
 | unit systemd | `/etc/systemd/system/eduvpn-radius.service` |
 | configurazione | `/etc/eduvpn-radius/eduvpn-radius.conf`, `0640`, solo se assente |
@@ -96,7 +98,8 @@ sudo ./install.sh
 
 Alla prima installazione la configurazione è un modello con valori segnaposto e
 il servizio **non** viene avviato. Se una configurazione esiste già, viene
-mantenuta e il servizio viene riavviato.
+mantenuta e il servizio viene riavviato se è attivo (un servizio fermato o
+disabilitato a mano resta com'è).
 
 <details>
 <summary>Installazione manuale (senza <code>install.sh</code>)</summary>
@@ -188,6 +191,7 @@ risposto.
 | `[radius]` | `port` | `1813` | porta RADIUS accounting |
 | `[radius]` | `secret` | *(obbligatoria)* | shared secret, lo stesso dell'agente RSSO del FortiGate |
 | `[radius]` | `nas_identifier` | nome host | `NAS-Identifier` di ogni pacchetto |
+| `[radius]` | `interim_interval` | `3600` | secondi tra due Interim-Update; tenerlo ben sotto il `rsso-context-timeout` del FortiGate; `0` = disattivato |
 | `[eduvpn]` | `log_path` | `/var/log/eduvpn/eduvpn.log` | log scritto da eduvpn-logger |
 | `[eduvpn]` | `state_path` | `/var/lib/eduvpn-radius/state.json` | sessioni aperte e posizione nel log |
 
@@ -201,7 +205,7 @@ Ogni pacchetto è un Accounting-Request (UDP, porta 1813 di default) con:
 
 | Attributo | Valore |
 |---|---|
-| `Acct-Status-Type` | `Start` (1) o `Stop` (2) |
+| `Acct-Status-Type` | `Start` (1), `Stop` (2) o `Interim-Update` (3) |
 | `User-Name` | user ID eduVPN, come scritto da eduvpn-logger |
 | `Framed-IP-Address` | indirizzo IPv4 di tunnel, se presente |
 | `Framed-IPv6-Address` | indirizzo IPv6 di tunnel, se presente (RFC 6911) |
@@ -228,7 +232,8 @@ l'Accounting-Response del FortiGate; senza risposta il daemon registra
   all'avvio gli eventi arretrati vengono rigiocati. Un fermo che copre più di una
   rotazione del log perde gli eventi del file più vecchio, già compresso.
 - **Primo avvio.** Le sessioni già aperte quando il daemon parte per la prima
-  volta restano sconosciute finché non si riconnettono.
+  volta restano sconosciute finché non si riconnettono, o finché
+  `systemctl restart eduvpn-logger` non le fa riannunciare da eduvpn-logger.
 
 ## Sicurezza e privacy
 
@@ -246,7 +251,7 @@ l'Accounting-Response del FortiGate; senza risposta il daemon registra
 ## Aggiornamento e rimozione
 
 Aggiornamento (configurazione e stato vengono mantenuti; il servizio viene
-riavviato):
+riavviato se è attivo):
 
 ```bash
 cd eduvpn-fortigate-rsso && git pull && sudo ./install.sh

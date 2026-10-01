@@ -15,6 +15,11 @@ secret = CHANGE_ME_use_a_long_random_secret
 # uses the local hostname (socket.gethostname()) as the default.
 #nas_identifier = vpn.example.org
 
+# Seconds between Accounting Interim-Updates for every open session. FortiGate
+# forgets an RSSO user after rsso-context-timeout (default 28800 s = 8 h) without
+# accounting for it: keep this well below that value. 0 = off. Default 3600.
+#interim_interval = 3600
+
 [eduvpn]
 # Path to the eduVPN correlator log (produced by eduvpn-logger or a
 # compatible tool). Default matches a stock eduvpn-logger install.

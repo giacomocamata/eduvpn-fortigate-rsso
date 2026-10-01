@@ -10,6 +10,8 @@ Event handling:
   connect    → Accounting-Start (user, profile, tunnel IPv4/IPv6)
   disconnect → Accounting-Stop  (same Acct-Session-Id as the Start)
   roam       → nothing: the tunnel IP does not change, only the public source IP
+  every hour → Accounting Interim-Update for every open session, or FortiGate
+               drops the user after its rsso-context-timeout (default 8 h)
 
 Restarts: the state file keeps the active sessions AND the position reached in
 the log. On start the daemon first replays what was logged while it was down,
@@ -55,11 +57,13 @@ DEFAULT_STATE  = "/var/lib/eduvpn-radius/state.json"
 DEFAULT_LOG    = "/var/log/eduvpn/eduvpn.log"
 DICT_PATH      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dictionary")
 RETRY_SEC      = 30.0   # how often unconfirmed Accounting-Starts are re-sent
+                        # (also: how long sends are skipped after a timeout)
 POLL_SEC       = 0.3    # log polling interval at EOF
 SAVE_SEC       = 1.0    # min interval between state saves while reading a backlog
 EXIT_CONFIG    = 2      # bad configuration: systemd must not restart-loop on it
 
-START, STOP = 1, 2
+START, STOP, INTERIM = 1, 2, 3
+_STATUS = {START: "Start", STOP: "Stop", INTERIM: "Interim-Update"}
 
 # --------------------------------------------------------------------------
 # Global state
@@ -78,6 +82,8 @@ radius_client: Optional["Client"] = None
 state_path: str = DEFAULT_STATE
 _shutdown = False
 _next_retry = 0.0  # 0 = retry at the first EOF (sessions restored from state)
+_next_interim = 0.0
+_down_until = 0.0  # FortiGate timed out: skip sends until then (see _send)
 _dirty = False     # sessions changed since the last save
 _last_save = 0.0
 
@@ -173,14 +179,20 @@ def _make_session_id() -> str:
     return uuid.uuid4().hex[:16]
 
 
-def _send(status_type: int, sess: dict) -> bool:
-    """Sends Accounting-Start (1) or -Stop (2). True if FortiGate answered."""
+def _send(status_type: int, sess: dict, probe: bool = False) -> bool:
+    """Sends Accounting-Start, -Stop or Interim-Update. True if FortiGate answered.
+    After a timeout, sends are skipped for RETRY_SEC: otherwise every event of
+    a FortiGate outage would stall the log for 10 s. Retry, interim and shutdown
+    rounds pass probe=True to try anyway."""
+    global _down_until
     if radius_client is None:
+        return False
+    if not probe and time.monotonic() < _down_until:
         return False
     try:
         pkt = radius_client.CreateAcctPacket()
         pkt["User-Name"]        = sess["user"]
-        pkt["Acct-Status-Type"] = "Start" if status_type == START else "Stop"
+        pkt["Acct-Status-Type"] = _STATUS[status_type]
         pkt["Acct-Session-Id"]  = sess["acct_session_id"]
         pkt["NAS-Identifier"]   = cfg["nas_identifier"]
         if sess.get("profile", "-") not in ("-", ""):
@@ -190,23 +202,26 @@ def _send(status_type: int, sess: dict) -> bool:
         if sess.get("ip6", "-") != "-":
             pkt["Framed-IPv6-Address"] = sess["ip6"]
         radius_client.SendPacket(pkt)
+        _down_until = 0.0
         return True
     except Timeout:
-        logger.warning("RADIUS timeout towards %s:%s", cfg.get("server", "?"), cfg.get("port", "?"))
+        logger.warning("RADIUS timeout towards %s:%s (sends paused for %ds)",
+                       cfg.get("server", "?"), cfg.get("port", "?"), RETRY_SEC)
+        _down_until = time.monotonic() + RETRY_SEC
         return False
     except Exception as e:
         logger.warning("RADIUS error: %s", e)
         return False
 
 
-def _start(conn: str, sess: dict, why: str) -> None:
-    sess["ok"] = _send(START, sess)
+def _start(conn: str, sess: dict, why: str, probe: bool = False) -> None:
+    sess["ok"] = _send(START, sess, probe)
     logger.info("start(%s) user=%s ip4=%s ip6=%s profile=%s ok=%s conn=%.12s",
                 why, sess["user"], sess["ip4"], sess["ip6"], sess["profile"], sess["ok"], conn)
 
 
-def _stop(conn: str, sess: dict, why: str) -> bool:
-    ok = _send(STOP, sess)
+def _stop(conn: str, sess: dict, why: str, probe: bool = False) -> bool:
+    ok = _send(STOP, sess, probe)
     logger.info("stop(%s) user=%s ip4=%s ip6=%s profile=%s ok=%s conn=%.12s",
                 why, sess["user"], sess["ip4"], sess["ip6"], sess["profile"], ok, conn)
     return ok
@@ -294,10 +309,32 @@ def retry_starts() -> None:
         return
     logger.info("Sending Accounting-Start for %d unconfirmed session(s)", len(pending))
     for conn, sess in pending:
-        _start(conn, sess, "retry")
+        _start(conn, sess, "retry", probe=True)
         if not sess["ok"]:
             break  # FortiGate unreachable: try the rest in RETRY_SEC, don't block
     _changed()
+
+
+def send_interims() -> None:
+    # FortiGate removes an RSSO user after rsso-context-timeout (default 8 h)
+    # without accounting for it, so long sessions would lose their identity.
+    # An Interim-Update resets that timer (a repeated Start could flush the
+    # user's firewall sessions when rsso-flush-ip-session is enabled).
+    global _next_interim
+    interval = int(cfg.get("interim_interval", "0"))
+    now = time.monotonic()
+    if not interval or now < _next_interim:
+        return
+    confirmed = [(c, s) for c, s in sessions.items() if s.get("ok")]
+    for n, (conn, sess) in enumerate(confirmed):
+        if not _send(INTERIM, sess, probe=True):
+            logger.warning("Interim-Update failed after %d of %d session(s); retrying in %ds",
+                           n, len(confirmed), RETRY_SEC)
+            _next_interim = now + RETRY_SEC
+            return
+    if confirmed:
+        logger.info("Interim-Update sent for %d session(s)", len(confirmed))
+    _next_interim = now + interval
 
 
 # --------------------------------------------------------------------------
@@ -387,6 +424,7 @@ def follow_log(log_path: str) -> None:
                     if _shutdown:
                         break
                     retry_starts()
+                    send_interims()
                     _maybe_save(force=True)
                     time.sleep(POLL_SEC)
                     # Rotated (inode changed or file gone): drain what was still
@@ -436,7 +474,7 @@ def stop_all() -> None:
     if sessions:
         logger.info("Shutdown: sending Accounting-Stop for %d session(s)", len(sessions))
     for conn, sess in list(sessions.items()):
-        if not _stop(conn, sess, "shutdown"):
+        if not _stop(conn, sess, "shutdown", probe=True):
             logger.warning("FortiGate not answering: remaining sessions not stopped")
             break
 
@@ -456,6 +494,7 @@ def _parse_config(parser: configparser.ConfigParser, config_path: str) -> Dict[s
             "port":           parser.get("radius", "port", fallback="1813").strip(),
             "secret":         parser.get("radius", "secret").strip(),
             "nas_identifier": parser.get("radius", "nas_identifier", fallback="").strip() or socket.gethostname(),
+            "interim_interval": parser.get("radius", "interim_interval", fallback="3600").strip(),
             "log_path":       parser.get("eduvpn", "log_path", fallback=DEFAULT_LOG).strip(),
             "state_path":     parser.get("eduvpn", "state_path", fallback=DEFAULT_STATE).strip(),
         }
@@ -467,6 +506,8 @@ def _parse_config(parser: configparser.ConfigParser, config_path: str) -> Dict[s
         _config_error("%s: [radius] port must be a number between 1 and 65535", config_path)
     if not c["secret"] or c["secret"].startswith("CHANGE_ME"):
         _config_error("%s: [radius] secret is not set (still the placeholder?)", config_path)
+    if not c["interim_interval"].isdigit() or 0 < int(c["interim_interval"]) < 60:
+        _config_error("%s: [radius] interim_interval must be 0 (off) or at least 60 seconds", config_path)
     return c
 
 
@@ -524,7 +565,7 @@ def run_test(ip: str) -> int:
 # Entry point
 # --------------------------------------------------------------------------
 def main() -> None:
-    global cfg, radius_client, state_path
+    global cfg, radius_client, state_path, _next_interim
 
     logging.basicConfig(
         level=logging.INFO,
@@ -550,6 +591,7 @@ def main() -> None:
     signal.signal(signal.SIGINT, _handle_signal)
 
     _load_state()
+    _next_interim = time.monotonic() + int(cfg["interim_interval"])
     logger.info("Started: FortiGate %s:%s, %d session(s) restored", cfg["server"], cfg["port"], len(sessions))
     follow_log(cfg["log_path"])
     stop_all()

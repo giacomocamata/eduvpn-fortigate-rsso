@@ -38,6 +38,7 @@ uses too:
 | `connect` with a tunnel IP held by another session | Stop for the other, then Start | the pool reassigned the address, so the other session's disconnect was missed and it is over |
 | `disconnect` | Accounting-Stop | same `Acct-Session-Id` as the Start |
 | `roam` | none | the tunnel IP does not change, only the public source address |
+| every `interim_interval` (1 h) | Interim-Update | for every open session: FortiGate forgets an RSSO user after its `rsso-context-timeout` (8 h by default) without accounting |
 | `connect` with `user=-` or without tunnel IP | none | nothing FortiGate could use |
 
 The daemon keeps its sessions and the position reached in the log in
@@ -49,7 +50,9 @@ The daemon keeps its sessions and the position reached in the log in
   rotation), then re-sends the Accounting-Start for the sessions still open,
   with their original session ids.
 - **FortiGate unreachable.** A Start that gets no answer is retried every 30 s
-  until FortiGate replies. Stops are not retried (see [Limitations](#limitations)).
+  until FortiGate replies. After a timeout, new packets are not sent for 30 s,
+  so an outage does not hold up the log by 10 s per event. Stops are not
+  retried (see [Limitations](#limitations)).
 - **Log rotation.** Both `create` and `copytruncate` rotations are followed by
   name, and no line written around a rotation is skipped.
 
@@ -85,7 +88,7 @@ sudo ./install.sh
 
 | Item | Path |
 |---|---|
-| packages | `python3`, `python3-pyrad` (pip fallback if the package is missing) |
+| packages | `python3`, `python3-pyrad` (no pip fallback: without the package the installer stops) |
 | program | `/usr/local/lib/eduvpn-radius/eduvpn-radius.py` and its RADIUS `dictionary` |
 | systemd unit | `/etc/systemd/system/eduvpn-radius.service` |
 | configuration | `/etc/eduvpn-radius/eduvpn-radius.conf`, `0640`, only if absent |
@@ -93,7 +96,8 @@ sudo ./install.sh
 
 On a first install the configuration is a template with placeholder values and
 the service is **not** started. When a configuration already exists, it is
-kept and the service is restarted.
+kept and the service is restarted if it is running (a service you stopped or
+disabled is left alone).
 
 <details>
 <summary>Manual installation (without <code>install.sh</code>)</summary>
@@ -182,6 +186,7 @@ Each session produces a `start(connect) user=… ok=True` line and later a
 | `[radius]` | `port` | `1813` | RADIUS accounting port |
 | `[radius]` | `secret` | *(required)* | shared secret, the same as the FortiGate RSSO agent |
 | `[radius]` | `nas_identifier` | host name | `NAS-Identifier` of every packet |
+| `[radius]` | `interim_interval` | `3600` | seconds between Interim-Updates; keep it well below FortiGate's `rsso-context-timeout`; `0` = off |
 | `[eduvpn]` | `log_path` | `/var/log/eduvpn/eduvpn.log` | log written by eduvpn-logger |
 | `[eduvpn]` | `state_path` | `/var/lib/eduvpn-radius/state.json` | open sessions and log position |
 
@@ -194,7 +199,7 @@ Every packet is an Accounting-Request (UDP, default port 1813) with:
 
 | Attribute | Value |
 |---|---|
-| `Acct-Status-Type` | `Start` (1) or `Stop` (2) |
+| `Acct-Status-Type` | `Start` (1), `Stop` (2) or `Interim-Update` (3) |
 | `User-Name` | eduVPN user ID, as written by eduvpn-logger |
 | `Framed-IP-Address` | tunnel IPv4 address, if any |
 | `Framed-IPv6-Address` | tunnel IPv6 address, if any (RFC 6911) |
@@ -220,7 +225,8 @@ Accounting-Response; without one the daemon logs `ok=False`.
   the backlog is replayed. A downtime spanning more than one log rotation loses
   the events of the older, already compressed file.
 - **First start.** Sessions that were already open when the daemon is started
-  for the first time are not known until they reconnect.
+  for the first time are not known until they reconnect, or until
+  `systemctl restart eduvpn-logger` makes eduvpn-logger announce them again.
 
 ## Security and privacy
 
@@ -236,7 +242,8 @@ Accounting-Response; without one the daemon logs `ok=False`.
 
 ## Upgrade and removal
 
-Upgrade (configuration and state are kept; the service is restarted):
+Upgrade (configuration and state are kept; the service is restarted if it is
+running):
 
 ```bash
 cd eduvpn-fortigate-rsso && git pull && sudo ./install.sh

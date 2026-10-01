@@ -21,11 +21,13 @@ if command -v apt-get >/dev/null 2>&1; then
 elif command -v dnf >/dev/null 2>&1; then
     dnf install -y python3 python3-pyrad || true
 fi
-if ! python3 -c 'import pyrad' 2>/dev/null; then
-    echo "WARN: no pyrad package — trying pip3 install pyrad" >&2
-    pip3 install pyrad || true
-fi
-python3 -c 'import pyrad' 2>/dev/null || { echo "ERROR: Python module pyrad not available — install it, then re-run" >&2; exit 1; }
+# No automatic pip fallback: an unpinned, system-wide `pip install` as root is
+# not something to do behind the administrator's back (PEP 668 refuses it anyway).
+python3 -c 'import pyrad' 2>/dev/null || {
+    echo "ERROR: Python module pyrad not available. Install python3-pyrad (EPEL on EL)," >&2
+    echo "       or pyrad in a way your policy allows, then re-run." >&2
+    exit 1
+}
 
 echo "==> Installing the daemon to $LIBDIR"
 install -d -m 0755 "$LIBDIR"
@@ -42,14 +44,15 @@ systemctl daemon-reload
 install -d -m 0750 "$ETCDIR"
 if [ -f "$CONF" ]; then
     echo "==> Keeping the existing configuration $CONF"
-    systemctl enable eduvpn-radius.service
-    # restart, not just start: on an upgrade the old code must not keep running
-    systemctl restart eduvpn-radius.service
-    cat <<'EOF'
-
-==> Done. eduvpn-radius restarted with the existing configuration:
-  sudo journalctl -u eduvpn-radius -f
-EOF
+    # Upgrade: restart only if running (the old code must not keep running) and
+    # never re-enable a service the administrator stopped or disabled.
+    systemctl try-restart eduvpn-radius.service
+    if systemctl is-active --quiet eduvpn-radius.service; then
+        echo "==> Done. eduvpn-radius restarted: sudo journalctl -u eduvpn-radius -f"
+    else
+        echo "==> Done. eduvpn-radius is not running; start it with:"
+        echo "     sudo systemctl enable --now eduvpn-radius.service"
+    fi
 else
     install -m 0640 "$SRC/eduvpn-radius.conf.example" "$CONF"
     cat <<EOF

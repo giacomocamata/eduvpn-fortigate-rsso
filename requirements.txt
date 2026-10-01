@@ -1,7 +1,5 @@
 # pyrad — RADIUS client library used to build/send Accounting packets.
-# On Debian/Ubuntu prefer the distro package instead:
-#   apt install python3-pyrad
-# install.sh tries the distro package first and falls back to pip
-# automatically (relevant mainly on Fedora/RHEL, where python3-pyrad may
-# not be packaged).
+# Prefer the distribution package: apt install python3-pyrad (Debian/Ubuntu),
+# dnf install python3-pyrad (Fedora; EPEL on EL). install.sh does not fall
+# back to pip: install it yourself if your platform has no package.
 pyrad>=2.4
